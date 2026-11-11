@@ -10,7 +10,7 @@ This is a candidate pool, like `general-corpus.md`. A question whose inventory
 turns up a real instance graduates into SKILL.md as a class, with its trigger,
 test shape and, where possible, a detector. "A lifecycle with no declared
 state" graduated this way on 2026-11-11, then CR, OW and WT, then SC, ID and
-CA, then FT, EF and WR.
+CA, then FT, EF and WR, then VS, SE and OR.
 
 ## How to run one
 
@@ -60,7 +60,8 @@ with no declared state".
 **VS. Version skew.** Which version of this code is running, and can two run at
 once? List every place one release's code drives, checks or reads data written
 by another: deploy drivers and the release they install, nodes on different
-releases, branches writing a store whose schema is behind them.
+releases, branches writing a store whose schema is behind them. Graduated:
+SKILL.md "A deploy runs two releases at once".
 
 **FT. Free-text contracts.** Is a decision carried in prose? List every read
 that matches a prefix, substring or regex in a note, detail, reason or log
@@ -101,6 +102,8 @@ Graduated: SKILL.md "A wait with no deadline, owner or end state".
 
 **SE. Side effects.** List every external effect (alert, webhook, push,
 restart, download, message). Can a test, scratch home or branch reach it?
+Graduated: SKILL.md "An effect reachable from a run that is not the live
+deploy", which cross-references "A non-production run writes live state".
 
 **WR. Writers and readers.** List every stored value. Does each have both a
 live writer and a live reader? Graduated: SKILL.md "A stored value with no
@@ -108,4 +111,5 @@ live writer, or no reader".
 
 **OR. Call order.** List every "A must happen before B" the code relies on
 (env sourcing, migration, connect before backend choice). Is the order
-enforced, or only usual?
+enforced, or only usual? Graduated: SKILL.md "An order the code needs but
+does not check".

@@ -769,3 +769,149 @@ def test_columns_paired_through_upserts_dynamic_inserts_and_selected_rows_are_le
     bad = {"app/migrations/v3.py": "SQL = \"ALTER TABLE jobs ADD COLUMN said TEXT\"\n"}
     assert column_sites({**innocent, **bad}) == ["app/migrations/v3.py:jobs.said:no-reader",
                                                  "app/migrations/v3.py:jobs.said:no-writer"]
+
+
+_SKEW = {"versions": ("SCHEMA_VERSION", "stored_schema"), "phases": ("smoke",), "markers": ("SMOKE_PHASE",)}
+
+
+def skew_sites(files, **config):
+    return sorted({h.site for h in detectors.one_sided_schema_check(detectors.parse(files), **config)})
+
+
+def test_a_one_sided_schema_check_a_dropped_mismatch_and_a_check_blind_to_its_phase_are_found():
+    bad = {"app/deploy.py": (
+        "import sys\nfrom app import store\nSCHEMA_VERSION = 5\n"
+        "def stale(conn, cwd):\n    code = schema_of(cwd)\n    have = store.stored_schema(conn)\n"
+        "    if code >= have:\n        return \"\"\n    return \"behind\"\n"
+        "def newer(conn):\n    if SCHEMA_VERSION < store.stored_schema(conn):\n        raise SystemExit(1)\n"
+        "def note(conn, row):\n    have = store.stored_schema(conn)\n    if have != SCHEMA_VERSION:\n"
+        "        print(\"skipped\", file=sys.stderr)\n        return None\n"
+        "    conn.execute(\"INSERT INTO d VALUES (?)\", row)\n"
+        "def smoke(argv):\n    for name in argv:\n        probe(name)\n"
+        "def probe(name):\n    return name\n"
+        "def live(conn):\n    if store.stored_schema(conn) != SCHEMA_VERSION:\n        conn.close()\n"
+        "        return _skip(\"another schema\")\n    return conn\n"
+        "def run(conn, release):\n    have, want = store.stored_schema(conn), plan(release)\n"
+        "    return want > have\n")}
+    assert skew_sites(bad, **_SKEW) == ["app/deploy.py:newer:one-sided", "app/deploy.py:note:drops",
+                                        "app/deploy.py:run:one-sided", "app/deploy.py:smoke:both-phases",
+                                        "app/deploy.py:stale:one-sided"]
+    assert skew_sites(bad, **_SKEW, skips=("_skip",)) == sorted(skew_sites(bad, **_SKEW) + ["app/deploy.py:live:drops"])
+    assert skew_sites(bad) == []
+
+
+def test_a_two_sided_or_raising_version_check_and_a_phase_aware_check_are_left_alone():
+    innocent = {"app/deploy.py": (
+        "import os\nfrom app import store\nSCHEMA_VERSION = 5\nLIMIT = 3\n"
+        "def migrate(conn):\n    have = store.stored_schema(conn)\n    if have > SCHEMA_VERSION:\n"
+        "        raise RuntimeError(\"newer store\")\n    if SCHEMA_VERSION > have:\n        upgrade(conn)\n"
+        "def exact(conn):\n    have = store.stored_schema(conn)\n    if have != SCHEMA_VERSION:\n"
+        "        raise RuntimeError(\"skew\")\n    return have < SCHEMA_VERSION\n"
+        "def strict(conn, hard):\n    if store.stored_schema(conn) != SCHEMA_VERSION:\n        if hard:\n"
+        "            raise SkewError\n        return None\n"
+        "def spooled(conn, row):\n    if store.stored_schema(conn) != SCHEMA_VERSION:\n        spool(row)\n"
+        "        return None\n"
+        "def size(xs, version):\n    return len(xs) < LIMIT or version < 3\n"
+        "def pair(conn, xs):\n    n, have = len(xs), store.stored_schema(conn)\n    return n < LIMIT and have\n"
+        "def smoke(argv):\n    for name in argv:\n        probe(name)\n"
+        "def probe(name):\n    if os.environ.get(\"SMOKE_PHASE\") == \"before\":\n        return None\n    return name\n"
+        "def smoke_main():\n    return probe(\"x\")\n")}
+    bad = {"app/q.py": "from app.deploy import SCHEMA_VERSION\ndef f(v):\n    return v <= SCHEMA_VERSION\n"}
+    assert skew_sites(innocent, **_SKEW) == []
+    assert skew_sites({**innocent, **bad}, **_SKEW) == ["app/q.py:f:one-sided"]
+
+
+_EFFECTS = {"effects": ("desktop", "post"), "live": ("DEFAULT_HOME", "live_home", "PYTEST_CURRENT_TEST"),
+            "guarded": ("osascript", "ssh")}
+_MONITOR = ("from urllib.request import urlopen\n"
+            "def post(url):\n    if not live_home():\n        return\n    urlopen(url)\n")
+
+
+def effect_sites(files, **config):
+    return sorted({h.site for h in detectors.effect_reachable(detectors.parse(files), **config)})
+
+
+def test_an_effect_with_no_live_gate_one_bound_as_a_default_and_an_unguarded_binary_are_found():
+    bad = {"app/monitor.py": _MONITOR, "app/notify.py": (
+        "import subprocess\nfrom app import monitor\nGH = \"gh\"\n"
+        "def desktop(msg):\n    subprocess.run([\"/usr/bin/osascript\", \"-e\", msg])\n"
+        "def alert(msg, home):\n    if home != DEFAULT_HOME:\n        return\n    desktop(msg)\n"
+        "def morning(msg):\n    desktop(msg)\n"
+        "def ci(gh=monitor.post):\n    return gh(\"x\")\n"
+        "def issues():\n    argv = [GH, \"issue\", \"create\"]\n    subprocess.run(argv)\n"
+        "def launch():\n    subprocess.Popen(\"launchctl bootstrap gui/1 x\", shell=True)\n")}
+    assert effect_sites(bad, **_EFFECTS) == ["app/notify.py:ci:default:post", "app/notify.py:issues:binary:gh",
+                                             "app/notify.py:launch:binary:launchctl", "app/notify.py:morning:desktop"]
+    assert effect_sites(bad) == ["app/notify.py:desktop:binary:osascript", "app/notify.py:issues:binary:gh",
+                                 "app/notify.py:launch:binary:launchctl"]
+
+
+def test_a_gated_effect_a_hook_resolved_at_call_time_and_guarded_binaries_are_left_alone():
+    innocent = {"app/monitor.py": _MONITOR, "app/notify.py": (
+        "import os, subprocess\nfrom app import monitor\n"
+        "def desktop(msg):\n    \"\"\"Not the DEFAULT_HOME gate, only its name.\"\"\"\n"
+        "    if os.environ.get(\"PYTEST_CURRENT_TEST\"):\n        return\n"
+        "    subprocess.run([\"osascript\", \"-e\", msg])\n"
+        "def morning(msg):\n    desktop(msg)\n"
+        "def ci(gh=None):\n    return (gh or monitor.post)(\"x\")\n"
+        "def status():\n    subprocess.run([\"git\", \"status\"])\n"
+        "def probe(pid):\n    os.kill(pid, 0)\n"
+        "def remote():\n    subprocess.run([\"ssh\", \"host\", \"true\"])\n")}
+    assert effect_sites(innocent, **_EFFECTS) == []
+    second = {"app/u.py": "def desktop(msg):\n    print(msg)\n"}
+    assert effect_sites({**innocent, **second}, **_EFFECTS) == ["app/notify.py:morning:desktop"]
+    bare = {"app/notify.py": innocent["app/notify.py"].replace("PYTEST_CURRENT_TEST", "VERBOSE")}
+    assert effect_sites({**innocent, **bare}, **_EFFECTS) == ["app/notify.py:morning:desktop"]
+
+
+_ORDER = {"effects": ("desktop",), "reads": ("hf_home",), "entries": ("main", "__main__"), "guard": ("env.guard",),
+          "needs": ("models_dir", "huggingface_hub"), "pairs": {"LOCALHARNESS_HOME": ("LOCALHARNESS_STORE", "pinned")}}
+
+
+def order_sites(files, **config):
+    return sorted({h.site for h in detectors.unchecked_order(detectors.parse(files), **config)})
+
+
+def test_a_default_bound_hook_an_import_time_read_an_unguarded_entry_and_a_home_without_its_backend_are_found():
+    bad = {"app/run.py": (
+        "import os\nfrom pathlib import Path\nfrom app import monitor, env\n"
+        "MODEL = os.environ.get(\"WHISPER_MODEL\", \"base\")\nBIN = Path" ".home() / \"bin\"\n"
+        "class Conf:\n    ROOT = env.hf_home()\n"
+        "def alert(msg, notify=monitor.desktop):\n    notify(msg)\n"
+        "def main():\n    print(models_dir())\n"
+        "def scratch(path):\n    for k, v in {\"LOCALHARNESS_HOME\": path, \"X\": \"1\"}.items():\n"
+        "        os.environ[k] = v\n"
+        "def fixture(monkeypatch, p):\n    monkeypatch.setenv(\"LOCALHARNESS_HOME\", p)\n"
+        "def direct(p):\n    os.environ[\"LOCALHARNESS_HOME\"] = p\n"
+        "def merged(p):\n    os.environ.update(LOCALHARNESS_HOME=p)\n"
+        "SCRATCH = {\"LOCALHARNESS_HOME\": \"\", \"HF_HOME\": \"hf\"}\n"
+        "def chaos(p):\n    for var, sub in SCRATCH.items():\n        os.environ[var] = p + sub\n"
+        "if __name__ == \"__main__\":\n    main()\n"),
+        "app/vlm.py": ("def label():\n    from huggingface_hub import hf_hub_download\n    return hf_hub_download(\"x\")\n"
+                       "if __name__ == \"__main__\":\n    label()\n")}
+    assert order_sites(bad, **_ORDER) == [
+        "app/run.py:<module>:import:WHISPER_MODEL", "app/run.py:<module>:import:hf_home",
+        "app/run.py:<module>:import:home()", "app/run.py:__main__:no-guard", "app/run.py:alert:default:desktop",
+        "app/run.py:chaos:LOCALHARNESS_HOME:no-backend",
+        "app/run.py:direct:LOCALHARNESS_HOME:no-backend", "app/run.py:fixture:LOCALHARNESS_HOME:no-backend",
+        "app/run.py:main:no-guard", "app/run.py:merged:LOCALHARNESS_HOME:no-backend",
+        "app/run.py:scratch:LOCALHARNESS_HOME:no-backend", "app/vlm.py:__main__:no-guard"]
+    assert order_sites(bad) == ["app/run.py:<module>:import:WHISPER_MODEL", "app/run.py:<module>:import:home()"]
+
+
+def test_reads_at_call_time_a_guarded_entry_and_a_home_set_with_its_backend_are_left_alone():
+    innocent = {"app/run.py": (
+        "import os\nfrom app import monitor, env, store\nLIMIT = 3\n"
+        "def model():\n    return os.environ.get(\"WHISPER_MODEL\", \"base\")\n"
+        "def alert(msg, notify=None):\n    (notify or monitor.desktop)(msg)\n"
+        "def main():\n    setup()\n    print(models_dir())\n"
+        "def setup():\n    app.env.guard()\n"
+        "def scratch(path):\n    os.environ[\"LOCALHARNESS_HOME\"] = path\n"
+        "    os.environ[\"LOCALHARNESS_STORE\"] = \"sqlite\"\n"
+        "def both(path):\n    os.environ.update(LOCALHARNESS_HOME=path, LOCALHARNESS_STORE=\"sqlite\")\n"
+        "def held(monkeypatch, path):\n    monkeypatch.setenv(\"LOCALHARNESS_HOME\", path)\n    store.pinned(path)\n"
+        "if __name__ == \"__main__\":\n    print(os.environ.get(\"DEBUG\"))\n    main()\n"),
+        "app/plain.py": "def main():\n    print(\"hi\")\nif __name__ == \"__main__\":\n    main()\n"}
+    bad = {"app/hf.py": "def main():\n    return models_dir()\n"}
+    assert order_sites(innocent, **_ORDER) == []
+    assert order_sites({**innocent, **bad}, **_ORDER) == ["app/hf.py:main:no-guard"]
