@@ -27,6 +27,15 @@ def test_every_shape_normalizes_to_the_same_table():
     assert moves.normalize(by_state)["failed"] == frozenset()
 
 
+def test_an_action_table_normalizes_to_moves_from_each_from_state():
+    actions = {"accept": (("offered",), "confirmed"), "lock": (("confirmed", "offered"), "locked"),
+               "start": ([None], "offered")}
+    assert moves.normalize(actions) == {None: {"offered"}, "offered": {"confirmed", "locked"},
+                                        "confirmed": {"locked"}, "locked": frozenset()}
+    table = MoveTable("app/booking.py:MOVES", actions, initial=[None], terminal=["locked"])
+    assert table.findings() == []
+
+
 def test_per_writer_tables_merge_into_one():
     a, b = {("x", "y"): {"job"}}, {("y", "z"): {"switch"}, ("x", "y"): {"settle"}}
     assert moves.merge(a, b) == {"x": {"y"}, "y": {"z"}, "z": frozenset()}

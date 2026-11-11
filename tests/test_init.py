@@ -180,26 +180,31 @@ def test_the_marker_is_left_out_when_the_repo_already_needs_312(tmp_path):
 REQ = "gauntlet @ git+https://example.org/g@v1"
 
 
-@pytest.mark.parametrize("before, where", [
-    ('[project]\nname = "x"\n\n[dependency-groups]\ndev = ["pytest"]\n', ("dependency-groups", "dev")),
-    ('[project]\nname = "x"\n\n[dependency-groups]\ndev = []\n', ("dependency-groups", "dev")),
-    ('[project]\nname = "x"\n\n[dependency-groups]\nlint = ["ruff"]\n', ("dependency-groups", "dev")),
-    ('[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = ["pytest"]\n',
-     ("project", "optional-dependencies", "dev")),
-    ('[project]\nname = "x"\n', ("dependency-groups", "dev")),
-    ('[project]\nname = "x"\n\n[dependency-groups]\ndev = ["gauntlet @ git+https://example.org/g@v0"]\n',
-     ("dependency-groups", "dev")),
+@pytest.mark.parametrize("before", [
+    '[project]\nname = "x"\n\n[dependency-groups]\ndev = ["pytest"]\n',
+    '[project]\nname = "x"\n\n[dependency-groups]\ndev = []\n',
+    '[project]\nname = "x"\n\n[dependency-groups]\nlint = ["ruff"]\n',
+    '[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = ["pytest"]\n',
+    '[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = ["pytest"]\n\n[tool.hatch.build]\nonly = ["x"]\n',
+    '[project]\nname = "x"\n',
+    '[project]\nname = "x"\n\n[dependency-groups]\ndev = ["gauntlet @ git+https://example.org/g@v0"]\n',
     ('[project]\nname = "x"\n\n[dependency-groups]\ndev = [\n    "gauntlet[hcl] @ git+https://example.org/g@v0 ; '
-     'python_version >= \'3.12\'",\n    "pytest",\n]\n', ("dependency-groups", "dev")),
-    ("[project]\nname = 'x'\n\n[dependency-groups]\ndev = ['gauntlet @ git+https://example.org/g@v0']\n",
-     ("dependency-groups", "dev")),
+     'python_version >= \'3.12\'",\n    "pytest",\n]\n'),
+    "[project]\nname = 'x'\n\n[dependency-groups]\ndev = ['gauntlet @ git+https://example.org/g@v0']\n",
+    '[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = ["gauntlet @ git+https://example.org/g@v0", "pytest"]\n',
+    ('[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = [\n    "pytest",\n    "gauntlet @ '
+     'git+https://example.org/g@v0 ; python_version >= \'3.12\'",\n]\n'),
+    '[project]\nname = "x"\n\n[project.optional-dependencies]\ndev = ["pytest", "gauntlet @ git+https://example.org/g@v0"]\n',
 ])
-def test_the_pin_lands_in_the_dev_dependencies_once(before, where):
-    data = tomllib.loads(init.add_pin(before, REQ))
-    for key in where:
-        data = data[key]
-    assert data.count(REQ) == 1
-    assert not [r for r in data if r.startswith("gauntlet") and r != REQ]
+def test_the_pin_lands_in_the_dev_group_once_and_never_in_an_extra(before):
+    after = init.add_pin(before, REQ)
+    assert init.pin_problem(after, REQ) is None
+    data = tomllib.loads(after)
+    assert data["dependency-groups"]["dev"].count(REQ) == 1
+    extras = data.get("project", {}).get("optional-dependencies", {})
+    assert "pytest" in extras.get("dev", ["pytest"])
+    assert not [r for reqs in extras.values() for r in reqs if r.startswith("gauntlet")]
+    assert not [r for r in data["dependency-groups"]["dev"] if r.startswith("gauntlet") and r != REQ]
 
 
 def test_init_needs_a_git_repo_with_python_or_terraform(tmp_path):
@@ -242,3 +247,99 @@ def test_a_detector_bound_class_needs_no_instance_and_any_other_class_does():
              "d": {"instances": [], "scanners": []}}
     assert registry.problems(index, {}, {}, snap, {}, ".") == [
         "d: no instance; a class is bound here only once it has bitten"]
+
+
+EXTRA = ('[project]\nname = "sample-app"\nversion = "0.1.0"\nrequires-python = ">=3.12"\ndependencies = []\n\n'
+         '[project.optional-dependencies]\ndev = ["pytest>=8"]\n')
+
+
+def test_a_repo_with_only_a_dev_extra_gets_a_dev_group_and_its_extra_is_left_alone(tmp_path):
+    root = _repo(tmp_path / "extra", {"pyproject.toml": EXTRA, "app/t.py": TABLE})
+    init.run(root)
+    data = tomllib.loads((root / "pyproject.toml").read_text())
+    assert data["dependency-groups"]["dev"] == [f"gauntlet @ {init.URL}@v{__version__}"]
+    assert data["project"]["optional-dependencies"] == {"dev": ["pytest>=8"]}
+    init.run(root, force=True)
+    data = tomllib.loads((root / "pyproject.toml").read_text())
+    assert data["dependency-groups"]["dev"] == [f"gauntlet @ {init.URL}@v{__version__}"]
+
+
+def _status(root):
+    return subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def test_a_crash_partway_through_init_writes_nothing(pyrepo, monkeypatch):
+    subprocess.run(["git", "-C", str(pyrepo), "add", "-A"], check=True)
+    before = (pyrepo / "pyproject.toml").read_text()
+
+    def boom(*a, **kw):
+        raise RuntimeError("a detector fell over")
+    monkeypatch.setitem(detectors.DETECTORS, "closed_tables", boom)
+    with pytest.raises(RuntimeError, match="fell over"):
+        init.run(pyrepo)
+    assert (pyrepo / "pyproject.toml").read_text() == before
+    assert _status(pyrepo) == "A  app/t.py\nA  pyproject.toml\n"
+
+
+CI = "jobs:\n  test:\n    steps:\n      - uses: actions/setup-python@v5\n        with:\n          python-version: {v}\n"
+MATRIX = ("jobs:\n  test:\n    strategy:\n      matrix:\n        python:\n          - \"3.10\"\n          - \"3.12\"\n"
+          "    steps:\n      - run: uv sync --python ${{ matrix.python }}\n")
+
+
+@pytest.mark.parametrize("rp, workflows, warned", [
+    (">=3.12", {}, []),
+    (">=3.12", {"ci.yml": CI.format(v='"3.12"')}, []),
+    (">=3.11", {}, ["requires-python '>=3.11'"]),
+    (">=3.12", {"ci.yml": CI.format(v='"3.11"')}, [".github/workflows/ci.yml runs Python 3.11"]),
+    (">=3.12", {"ci.yaml": CI.format(v="['3.9', '3.13']")}, [".github/workflows/ci.yaml runs Python 3.9"]),
+    (">=3.12", {"t.yml": MATRIX}, [".github/workflows/t.yml runs Python 3.10"]),
+    (">=3.12", {"t.yml": "jobs:\n  t:\n    steps:\n      - run: uv run --python 3.11 pytest\n"},
+     [".github/workflows/t.yml runs Python 3.11"]),
+])
+def test_init_warns_where_the_repo_runs_python_older_than_312(tmp_path, capsys, rp, workflows, warned):
+    files_ = {"pyproject.toml": PYPROJECT.format(rp=rp), "app/t.py": TABLE}
+    files_.update({f".github/workflows/{name}": text for name, text in workflows.items()})
+    root = _repo(tmp_path / "ci", files_)
+    assert cli.main(["init", "--root", str(root)]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("warning: ")]
+    assert len(lines) == len(warned)
+    for line, start in zip(lines, warned):
+        assert line.startswith(f"warning: {start}") and init.TEST_REL in line
+
+
+def test_init_prints_the_ratchet_count_the_generated_module_holds(pyrepo, capsys):
+    assert cli.main(["init", "--root", str(pyrepo)]) == 0
+    n = len(_ratchets(pyrepo))
+    assert n >= 10
+    assert f"ratchet tests: {n} in {init.TEST_REL}: expect `{n} passed`" in capsys.readouterr().out
+
+
+ACTIONS = ('OFFERED, CONFIRMED, LOCKED = "offered", "confirmed", "locked"\n'
+           'MOVES = {"accept": ((OFFERED,), CONFIRMED), "lock": ((CONFIRMED, OFFERED), LOCKED)}\n')
+
+
+def test_init_wires_a_repo_whose_move_table_maps_actions_to_from_and_to_states(pyrepo):
+    (pyrepo / "app" / "booking.py").write_text(ACTIONS, encoding="utf-8")
+    init.run(pyrepo)
+    assert "'app/booking.py:MOVES': " in (pyrepo / init.REGISTRY_REL).read_text()
+    assert _failing(pyrepo) == {}
+
+
+HIDE = ('import sys\nfrom pathlib import Path\nfrom importlib.machinery import PathFinder\n\n\n'
+        'class Hide:\n    # Python below 3.12 as the marker leaves it: no gauntlet package installed.\n'
+        '    def find_spec(self, name, path=None, target=None):\n'
+        '        if name != "gauntlet":\n            return None\n'
+        '        bare = [p for p in sys.path if not (Path(p or ".") / "gauntlet" / "__init__.py").exists()]\n'
+        '        return PathFinder.find_spec(name, bare)\n\n\n'
+        'for _m in [m for m in sys.modules if m == "gauntlet" or m.startswith("gauntlet.")]:\n'
+        '    del sys.modules[_m]\nsys.meta_path.insert(0, Hide())\n')
+
+
+def test_the_generated_ratchets_skip_where_gauntlet_is_not_installed(pyrepo):
+    init.run(pyrepo)
+    (pyrepo / "conftest.py").write_text(HIDE, encoding="utf-8")
+    env = {**__import__("os").environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", init.TEST_REL],
+                         cwd=pyrepo, capture_output=True, text=True, env=env)
+    assert run.returncode == 5 and "1 skipped" in run.stdout, run.stdout + run.stderr

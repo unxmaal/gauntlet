@@ -19,10 +19,24 @@ def _pair(key):
     return isinstance(key, tuple) and len(key) == 2
 
 
+def _action(value):
+    # One action's (from-states, to-state): a collection of states, then one state.
+    many = (tuple, list, set, frozenset)
+    return isinstance(value, (tuple, list)) and len(value) == 2 and isinstance(value[0], many) and not isinstance(
+        value[1], (*many, dict))
+
+
 def normalize(moves):
-    """{state: frozenset(next)} from {state: next-states}, {(leaves, enters): anything}, or (leaves, enters) pairs."""
+    """{state: frozenset(next)} from {state: next-states}, {(leaves, enters): anything}, (leaves, enters) pairs, or
+    {action: (from-states, to-state)}."""
     out = {}
-    if isinstance(moves, Mapping) and moves and not all(_pair(k) for k in moves):
+    if isinstance(moves, Mapping) and moves and not all(_pair(k) for k in moves) and all(
+            _action(v) for v in moves.values()):
+        for froms, to in moves.values():
+            out.setdefault(to, set())
+            for frm in froms:
+                out.setdefault(frm, set()).add(to)
+    elif isinstance(moves, Mapping) and moves and not all(_pair(k) for k in moves):
         for frm, nexts in moves.items():
             if isinstance(nexts, (str, bytes)) or nexts is None:
                 raise TypeError(f"{frm!r}: next states must be a collection, got {nexts!r}")

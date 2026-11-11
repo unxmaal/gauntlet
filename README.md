@@ -16,7 +16,7 @@ The skill: symlink the skill directory to this checkout's corpus.
 
 The package, pinned to a tag:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.0"
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.1"
     gauntlet classes          # the corpus this version ships
     gauntlet corpus-dir       # where it lives
 
@@ -25,16 +25,18 @@ whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
 ## Wiring a repo with `gauntlet init`
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.0" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.1" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
 
-In a Python repo it adds the dev-dependency pin to `pyproject.toml` (with `python_version >= '3.12'` when
-`requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`, `tests/test_gauntlet.py`, the
-skill snapshot, an empty defects snapshot and a backlog of today's hits, so the first run passes and only a new hit
-fails. The index holds every corpus class a detector covers; `hcl` joins the front ends when the repo has `.tf`
-files. What init cannot know (production paths, `detector_config` values, move tables) is a `# TODO(gauntlet):` line
-in the registry. It refuses to overwrite a registry without `--force`. A Terraform repo with no `pyproject.toml`
-gets the minimal form instead: `.gauntlet/baseline.json` and `.gauntlet/check.sh`, which runs
-`gauntlet scan --frontend hcl --baseline .gauntlet/baseline.json` and fails on a finding not in the baseline.
+In a Python repo it adds the pin to `[dependency-groups] dev` in `pyproject.toml`, never to an extra (with
+`python_version >= '3.12'` when `requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`,
+`tests/test_gauntlet.py`, the skill snapshot, an empty defects snapshot and a backlog of today's hits, so the first
+run passes and only a new hit fails. The index holds every corpus class a detector covers; `hcl` joins the front
+ends when the repo has `.tf` files. What init cannot know (production paths, `detector_config` values, move tables)
+is a `# TODO(gauntlet):` line in the registry. It refuses to overwrite a registry without `--force`, writes nothing
+unless every file was computed, prints how many ratchet tests to expect, and warns where `requires-python` or a CI
+workflow runs Python below 3.12. A Terraform repo with no `pyproject.toml` gets the minimal form instead:
+`.gauntlet/baseline.json` and `.gauntlet/check.sh`, which runs `gauntlet scan --frontend hcl --baseline
+.gauntlet/baseline.json` and fails on a finding not in the baseline.
 `corpus/INSTALL.md` is the same as a runbook, step by step.
 
 ## Wiring a consumer's registry by hand
@@ -83,8 +85,8 @@ MoveTable("app/job_state.py:MOVES", j.MOVES, initial=[j.PENDING], terminal=[j.DO
           reopens=reopens_by(j.MOVES, {j.REFETCH}), states=j.STATES)
 ```
 
-`moves` accepts `{state: next_states}`, `{(leaves, enters): reasons_or_writers}` or a set of `(leaves, enters)`
-pairs; `moves.merge(...)` unions per-writer tables. The ratchet then fails on an unreachable state, a non-terminal
+`moves` accepts `{state: next_states}`, `{(leaves, enters): reasons_or_writers}`, a set of `(leaves, enters)`
+pairs or `{action: (from_states, to_state)}`; `moves.merge(...)` unions per-writer tables. The ratchet then fails on an unreachable state, a non-terminal
 dead end, a terminal that moves by anything but a named reopen, and a declared or used state the table never names.
 It also fails on any module constant named `MOVES`, `TRANSITIONS` or `*_MOVES` holding such pairs that has no
 `MoveTable` and no reason in `Registry(move_waivers={site: why})`. Without a Registry, `moves.assert_sound(tables)`

@@ -501,6 +501,35 @@ def test_a_terminal_state_read_elsewhere_is_left_alone_and_registered_tables_are
     assert [h.site for h in got] == ["app/js.py:MOVES:stuck"]
 
 
+_BOOKING = ("OFFERED = \"offered\"\nCONFIRMED = \"confirmed\"\nLOCKED = \"locked\"\nLAPSED = \"lapsed\"\n"
+            "MOVES = {\"accept\": ((OFFERED,), CONFIRMED), \"lock\": ((CONFIRMED, OFFERED), LOCKED),\n"
+            "         \"expire\": ((OFFERED,), \"lapsed\")}\n")
+_BOOKING_REPORT = "from app import booking\ndef locked(rows):\n    return [r for r in rows if r.state == booking.LOCKED]\n"
+
+
+def test_an_action_to_from_and_to_states_table_does_not_crash_the_walker():
+    trees = detectors.parse({"app/booking.py": _BOOKING})
+    detectors.terminal_without_reader(trees)
+    assert sites(detectors.move_tables, {"app/booking.py": _BOOKING}) == ["app/booking.py:MOVES"]
+
+
+def test_an_action_table_is_read_as_moves_from_each_from_state_to_the_to_state():
+    tree = detectors.parse({"app/booking.py": _BOOKING})["app/booking.py"]
+    (rel, name, line, table, names), = detectors._found_tables({"app/booking.py": tree})
+    assert table == {"offered": {"confirmed", "locked", "lapsed"}, "confirmed": {"locked"}, "locked": set(),
+                     "lapsed": set()}
+    assert names["offered"] == {"OFFERED"} and names["lapsed"] == set()
+    got = sites(detectors.terminal_without_reader, {"app/booking.py": _BOOKING, "app/report.py": _BOOKING_REPORT})
+    assert got == ["app/booking.py:MOVES:lapsed"]
+
+
+def test_a_move_table_node_the_walker_does_not_know_is_skipped():
+    src = "MOVES = {\"a\": {\"b\", f(x)}, \"b\": {(\"c\", \"d\")}, \"c\": set()}\n"
+    tree = detectors.parse({"app/m.py": src})["app/m.py"]
+    (_, _, _, table, _), = detectors._found_tables({"app/m.py": tree})
+    assert table == {"a": {"b"}, "b": set(), "c": set()}
+
+
 def test_run_hands_a_detector_its_configuration():
     files = {"app/r.py": "from lib import store\ndef f(conn):\n    k = store.put(1)\n"
                          "    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n"}

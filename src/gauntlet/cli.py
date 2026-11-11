@@ -95,13 +95,17 @@ def _against_baseline(found, a):
 
 def cmd_init(a):
     from gauntlet import init
-    written, todos, backlog, notes = init.run(a.root, a.pin, a.force)
-    for rel in written:
+    r = init.run(a.root, a.pin, a.force)
+    for rel in r.written:
         print(f"wrote {rel}")
-    print(f"backlog: {backlog} hit(s) seeded")
-    print(f"TODO lines: {todos}" + (f" in {init.REGISTRY_REL}: ask the user before filling any" if todos else ""))
-    for note in notes:
+    print(f"backlog: {r.backlog} hit(s) seeded")
+    print(f"TODO lines: {r.todos}" + (f" in {init.REGISTRY_REL}: ask the user before filling any" if r.todos else ""))
+    if r.ratchets:
+        print(f"ratchet tests: {r.ratchets} in {init.TEST_REL}: expect `{r.ratchets} passed`")
+    for note in r.notes:
         print(f"note: {note}")
+    for warning in r.warnings:
+        print(f"warning: {warning}")
     return 0
 
 
