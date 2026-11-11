@@ -1473,12 +1473,15 @@ def _prose_subject(n):
     return None
 
 
-def prose_match(trees, production=default_production, fields=()):
+def prose_match(trees, production=default_production, fields=(), migrations=()):
     """A decision read back out of a sentence: SQL LIKE/GLOB/instr, startswith/endswith, `"x" in` or a regex on a
-    field the consumer names as stored prose (`fields`, such as note, detail, reason). Finds nothing until told."""
+    field the consumer names as stored prose (`fields`, such as note, detail, reason). Finds nothing until told.
+    Paths under `migrations` are skipped: a migration lifting old prose into a column is the fix, not the defect."""
     fields = set(fields)
     out = []
     for rel, tree in _prod(trees, production).items():
+        if rel.startswith(tuple(migrations)):
+            continue
         found = {}
         for qual, line, text in _strings(tree):
             if not _SQL_START.search(text):
@@ -1940,10 +1943,15 @@ def effect_reachable(trees, production=default_production, effects=(), live=(), 
     binary (`binaries`) that the test guard's list (`guarded`) lacks."""
     prod = _prod(trees, production)
     effects, live, guarded, binaries = tuple(effects), set(live), set(guarded), set(binaries)
+    owners = {}  # an effect's bare name -> the modules a dotted effect names, or None when any module may define it
+    for e in effects:
+        mod, _, bare = e.rpartition(".")
+        if owners.get(bare, ()) is not None:
+            owners[bare] = None if not mod else {*owners.get(bare, ()), mod.rsplit(".", 1)[-1]}
     gated = {}
-    for tree in prod.values():
+    for rel, tree in prod.items():
         for _, fn in _scopes(tree):
-            if _named(ast.Name(id=fn.name), effects):
+            if fn.name in owners and (owners[fn.name] is None or Path(rel).stem in owners[fn.name]):
                 gated[fn.name] = gated.get(fn.name, True) and bool(live & _names_in(fn))
     out = []
     for rel, tree in prod.items():
@@ -2102,17 +2110,24 @@ DETECTORS = {
 }
 
 
+def names(entry):
+    """The detector names an index entry gives: one name or a list of them."""
+    d = entry.get("detector")
+    return (d,) if isinstance(d, str) else tuple(d or ())
+
+
 def run(trees, index, production=default_production, detectors=None, config=None):
     """`config` maps a detector name to the keyword arguments a consumer supplies it (committers, tables, columns)."""
     table = {**DETECTORS, **(detectors or {})}
     config = config or {}
     out = {}
     for cid, entry in index.items():
-        name = entry.get("detector")
-        if name in table:
+        known = [name for name in names(entry) if name in table]
+        if known:
             hits = {}
-            for h in table[name](trees, production, **config.get(name, {})):
-                hits.setdefault(h.site, h)
+            for name in known:
+                for h in table[name](trees, production, **config.get(name, {})):
+                    hits.setdefault(h.site, h)
             out[cid] = sorted(hits.values())
     return out
 

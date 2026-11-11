@@ -950,3 +950,37 @@ def test_lowercase_sql_is_read_like_uppercase_sql():
         "app/migrations/v3.py": "SQL = \"ALTER TABLE jobs ADD COLUMN said TEXT\"\n"}
     assert column_sites(lowered(cols)) == column_sites(cols)
     assert "app/migrations/v3.py:jobs.said:no-writer" in column_sites(cols)
+
+
+def test_a_class_with_two_detectors_runs_both():
+    trees = detectors.parse({"app/r.py": "def f(store, k):\n    store.put(k)\n    store.link(k)\n"})
+    both = lambda trees, production, tag="": [detectors.Hit(f"app/r.py:{tag}a", 1, "a")]
+    other = lambda trees, production: [detectors.Hit("app/r.py:b", 2, "b")]
+    extra = {"one": both, "two": other}
+    got = detectors.run(trees, {"c": {"detector": ("one", "two")}}, detectors=extra, config={"one": {"tag": "x"}})
+    assert [h.site for h in got["c"]] == ["app/r.py:b", "app/r.py:xa"]
+    assert detectors.names({"detector": "one"}) == ("one",)
+    assert detectors.names({"detector": ["one", "two"]}) == ("one", "two")
+    assert detectors.names({}) == ()
+
+
+def test_a_dotted_effect_finds_its_own_definition_and_its_gate():
+    files = {"pkg/monitor.py": "def alert(kind, home=None):\n    if live_home(home):\n        send(kind)\n",
+             "pkg/deploy.py": "from pkg import monitor\ndef _alert_here(k):\n    monitor.alert(k)\n"}
+    assert effect_sites(files, effects=("monitor.alert",), live=("live_home",)) == []
+    assert effect_sites(files, effects=("alert",), live=("live_home",)) == []
+    ungated = {**files, "pkg/monitor.py": "def alert(kind, home=None):\n    send(kind)\n"}
+    assert effect_sites(ungated, effects=("monitor.alert",), live=("live_home",)) == [
+        "pkg/deploy.py:_alert_here:monitor.alert"]
+    elsewhere = {**files, "pkg/monitor.py": "from pkg.vendor import alert\n",
+                 "pkg/other.py": "def alert(kind):\n    if live_home():\n        send(kind)\n"}
+    assert effect_sites(elsewhere, effects=("monitor.alert",), live=("live_home",)) == [
+        "pkg/deploy.py:_alert_here:monitor.alert"]
+
+
+def test_prose_lifted_by_a_migration_is_left_alone():
+    files = {"app/migrations/v9.py": "def up(row):\n    return row[\"note\"].startswith(\"superseded by \")\n",
+             "app/gate.py": "def held(job):\n    return job[\"note\"].startswith(\"superseded by \")\n"}
+    assert prose_sites(files) == ["app/gate.py:held:note", "app/migrations/v9.py:up:note"]
+    got = detectors.prose_match(detectors.parse(files), fields=_PROSE, migrations=("app/migrations/",))
+    assert sorted(h.site for h in got) == ["app/gate.py:held:note"]

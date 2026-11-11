@@ -40,7 +40,7 @@ class PythonFrontEnd:
         texts = {rel: (root / rel).read_text(encoding="utf-8", errors="replace") for rel in files}
         index = index if index is not None else _default_index(self.detectors())
         hits = detectors.run(detectors.parse(texts), index, self.production, self.extra, config)
-        rules = {cid: e.get("detector", "") for cid, e in index.items()}
+        rules = {cid: "+".join(detectors.names(e)) for cid, e in index.items()}
         return findings.from_hits(hits, "gauntlet", rules)
 
 
