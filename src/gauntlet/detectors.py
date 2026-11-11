@@ -1037,7 +1037,379 @@ def terminal_without_reader(trees, production=default_production, tables=None):
     return out
 
 
+_SQL_START = re.compile(r"(?s)^\s*(?:SELECT|UPDATE|DELETE|WITH|INSERT)\b")
+_BY_ID = re.compile(r"(?is)\bWHERE\s+(?:\w+\.)?id\s*(?:=|\bIN\b)")
+_CREATE = re.compile(r"(?is)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)")
+
+
+def _concat(node):
+    # A string chain's text, with each interpolated or concatenated expression kept as its source.
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else f" {ast.unparse(v.value)} " for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _concat(node.left), _concat(node.right)
+        if left is None and right is None:
+            return None
+        return (left if left is not None else f" {ast.unparse(node.left)} ") + \
+               (right if right is not None else f" {ast.unparse(node.right)} ")
+    return None
+
+
+def _strings(tree):
+    # (qualname, line, text) for each outermost string expression: a chain is read whole, never part by part.
+    owner = _innermost(tree)
+    inner = set()
+    out = []
+    for n in _walk(tree):
+        if id(n) in inner or not isinstance(n, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+            continue
+        text = _concat(n)
+        if text is None:
+            continue
+        inner |= {id(m) for m in _walk(n) if m is not n}
+        out.append((owner.get(id(n), "<module>"), n.lineno, text))
+    return out
+
+
+def _word(names):
+    return re.compile(r"(?<![\w.])(?:\w+\.)*(?:" + "|".join(map(re.escape, names)) + r")\b") if names else None
+
+
+def _declared_scoped(prod, columns):
+    col = _word(columns)
+    out = set()
+    for tree in prod.values():
+        for _, _, text in _strings(tree):
+            parts = _CREATE.split(text)
+            for name, body in zip(parts[1::2], parts[2::2]):
+                if col.search(body):
+                    out.add(name.lower())
+    return out
+
+
+def _helper_named(rel, qual, helpers):
+    return any(h == f"{rel}:{qual}" or h == qual for h in helpers)
+
+
+def unscoped_query(trees, production=default_production, columns=(), tables=(), helpers=(), null_helper=None):
+    """A query on a table several scopes share that does not filter on the scope; and a scope's NULL meaning written
+    anywhere but the one helper named for it. `columns` name the scope columns; `tables` add scoped tables to those
+    whose CREATE TABLE names a scope column; `helpers` are fragments that stand for the scope predicate."""
+    if not columns:
+        return []
+    prod = _prod(trees, production)
+    scoped = {t.lower() for t in tables} | _declared_scoped(prod, columns)
+    scope = _word(tuple(columns) + tuple(helpers))
+    null = re.compile(r"(?i)(?<![\w.])(?:\w+\.)?(" + "|".join(map(re.escape, columns)) + r")\s+IS\s+(?:NOT\s+)?NULL\b")
+    refs = re.compile(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+(?i:(" + "|".join(map(re.escape, sorted(scoped))) + r"))\b") \
+        if scoped else None
+    out = []
+    for rel, tree in prod.items():
+        for qual, line, text in _strings(tree):
+            if null.search(text) and not (null_helper and _helper_named(rel, qual, [null_helper])):
+                out.append(Hit(f"{rel}:{qual}:null-scope", line, "the scope's NULL meaning written outside the one "
+                               "helper that owns it; another copy can give an unstamped row another meaning"))
+            if refs is None or not _SQL_START.search(text) or _CREATE.search(text):
+                continue
+            if re.match(r"(?s)\s*INSERT\b(?!.*\bSELECT\b)", text):
+                continue
+            if scope.search(text) or _BY_ID.search(text):
+                continue
+            for table in sorted({m.lower() for m in refs.findall(text)}):
+                out.append(Hit(f"{rel}:{qual}:{table}", line, f"a query on {table}, which several scopes share, with "
+                               "no scope predicate: it reads or writes every scope's rows"))
+    return out
+
+
+_FROM_STORE = {"read_text", "read_bytes", "read", "readline", "readlines", "load", "loads", "safe_load",
+               "fetchone", "fetchall", "fetchmany", "execute", "open"}
+_IDENTITY_CALLS = {"getpgid", "create_time", "cmdline", "Process", "exe"}
+_IDENTITY = re.compile(r"(?i)pgid|start_?time|started|create_time|cmdline|command|\bcomm\b|boot")
+
+
+def _module_aliases(tree):
+    return {(a.asname or a.name).split(".")[0] for n in _walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+            for a in n.names}
+
+
+def _stored_names(fn, readers=frozenset(), modules=frozenset()):
+    # Names whose value came from a file, a row or a parsed record, followed through assignments, loops and withs.
+    # A repo function that reads counts only when called by name or through a module, never as any object's method.
+    tainted = set()
+
+    def source(call):
+        name = _call_name(call)
+        if name in _FROM_STORE:
+            return True
+        f = call.func
+        return name in readers and (isinstance(f, ast.Name) or (
+            isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in modules))
+
+    def stored(node):
+        return any((isinstance(m, ast.Call) and source(m))
+                   or (isinstance(m, ast.Name) and m.id in tainted) for m in _walk(node))
+    nodes = _own(fn)
+    for _ in range(3):
+        before = len(tainted)
+        for n in nodes:
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None and stored(n.value):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name)}
+            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)) and stored(n.iter):
+                tainted |= {x.id for x in _walk(n.target) if isinstance(x, ast.Name)}
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None and stored(n.context_expr):
+                tainted |= {x.id for x in _walk(n.optional_vars) if isinstance(x, ast.Name)}
+            elif isinstance(n, ast.NamedExpr) and stored(n.value):
+                tainted.add(n.target.id)
+        if len(tainted) == before:
+            break
+    return stored
+
+
+def _checks_identity(fn, helpers=frozenset()):
+    for n in _own(fn):
+        if isinstance(n, ast.Call) and (_call_name(n) in _IDENTITY_CALLS or _call_name(n) in helpers):
+            return True
+        if isinstance(n, ast.Compare) and any(
+                _IDENTITY.search(m.id if isinstance(m, ast.Name) else m.attr if isinstance(m, ast.Attribute)
+                                 else _str(m) or "") for m in _walk(n)):
+            return True
+    return False
+
+
+def _kill_zero(call):
+    return (isinstance(call, ast.Call) and _call_name(call) == "kill" and len(call.args) == 2
+            and isinstance(call.args[1], ast.Constant) and call.args[1].value == 0)
+
+
+def _alive_helpers(prod):
+    out = set()
+    for tree in prod.values():
+        for name, fn in _scopes(tree):
+            params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+            if not _checks_identity(fn) and any(
+                    _kill_zero(n) and isinstance(n.args[0], ast.Name) and n.args[0].id in params for n in _own(fn)):
+                out.add(name.rsplit(".", 1)[-1])
+    return out
+
+
+def stored_pid_liveness(trees, production=default_production, alive=()):
+    """A pid read back from a file or row and checked only for liveness: a reused pid reads as the same process.
+    `alive` names liveness helpers the scan cannot see; a helper that only does os.kill(pid, 0) is found."""
+    prod = _prod(trees, production)
+    helpers = _alive_helpers(prod) | set(alive)
+    readers = {name.rsplit(".", 1)[-1] for tree in prod.values() for name, fn in _scopes(tree)
+               if any(isinstance(n, ast.Return) and n.value is not None for n in _own(fn))
+               and any(isinstance(n, ast.Call) and _call_name(n) in _FROM_STORE for n in _own(fn))} - helpers
+    checkers = {name.rsplit(".", 1)[-1] for tree in prod.values() for name, fn in _scopes(tree) if _checks_identity(fn)}
+    out = []
+    for rel, tree in prod.items():
+        modules = _module_aliases(tree)
+        for name, fn in _bodies(tree):
+            stored = None
+            for n in _own(fn):
+                if not isinstance(n, ast.Call):
+                    continue
+                if _kill_zero(n):
+                    pid = n.args[0]
+                elif _call_name(n) in helpers and n.args:
+                    pid = n.args[0]
+                else:
+                    continue
+                stored = stored or _stored_names(fn, readers, modules)
+                if stored(pid) and not _checks_identity(fn, checkers):
+                    out.append(Hit(f"{rel}:{name}", n.lineno, "a stored pid checked only for liveness; once it is "
+                                   "reused, any process under that pid reads as the one that was recorded"))
+                    break
+    return out
+
+
+_CACHE_DECOS = {"cache", "lru_cache", "cached_property"}
+_SUBPROCESS = {"run", "check_output", "check_call", "call", "Popen", "getoutput", "getstatusoutput"}
+_STAMP = re.compile(r"(?i)mtime|version|stamp|digest|sha\d*$|etag|ctime|size|generation|^rev$|_rev$")
+
+
+def _cache_deco(fn):
+    for d in fn.decorator_list:
+        target = d.func if isinstance(d, ast.Call) else d
+        name = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else None
+        if name in _CACHE_DECOS:
+            return True
+    return False
+
+
+def _reads_source(fn, readers=()):
+    for n in _own(fn):
+        if not isinstance(n, ast.Call):
+            continue
+        name = _call_name(n)
+        recv = ast.unparse(n.func.value) if isinstance(n.func, ast.Attribute) else ""
+        if (name == "open" and isinstance(n.func, ast.Name)) or name in ("read_text", "read_bytes") \
+                or name in ("getoutput", "check_output", "popen") or name in readers \
+                or (name in _SUBPROCESS and recv == "subprocess"):
+            return True
+    return False
+
+
+def _params(fn):
+    a = fn.args
+    return [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [v for v in (a.vararg, a.kwarg) if v]
+            if x.arg not in ("self", "cls")]
+
+
+def _memo_global(fn):
+    # A function that keeps its answer in a module global: `global X`, an assignment to X, and a return of X.
+    names = {g for n in _own(fn) if isinstance(n, ast.Global) for g in n.names}
+    if not names:
+        return False
+    nodes = _own(fn)
+    sets = {t.id for n in nodes if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    rets = {n.value.id for n in nodes if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)}
+    return bool(names & sets & rets)
+
+
+def _locks(fn):
+    for n in _own(fn):
+        if isinstance(n, ast.Call) and _call_name(n) in ("flock", "lockf", "FileLock", "SoftFileLock", "acquire"):
+            return True
+        if isinstance(n, ast.withitem) and re.search(r"(?i)lock", ast.unparse(n.context_expr)):
+            return True
+    return False
+
+
+def _json_rmw(fn):
+    # (read keys, write keys) for JSON files this function reads and writes, each key the path's source text.
+    nodes = _own(fn)
+    assigned = {}
+    for n in nodes:
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            assigned.setdefault(n.targets[0].id, []).append(n.value)
+
+    def key(e, depth=0):
+        if isinstance(e, ast.Name) and len(assigned.get(e.id, ())) == 1 and depth < 4:
+            return key(assigned[e.id][0], depth + 1)
+        return ast.unparse(e)
+    def opened(call):
+        if not (isinstance(call, ast.Call) and _call_name(call) == "open"):
+            return None
+        if isinstance(call.func, ast.Attribute) and ast.unparse(call.func.value) not in ("io", "builtins"):
+            return call.func.value
+        return call.args[0] if call.args else None
+    handles = {}
+    for n in nodes:
+        if isinstance(n, ast.withitem) and isinstance(n.optional_vars, ast.Name) and opened(n.context_expr):
+            handles[n.optional_vars.id] = (key(opened(n.context_expr)), _mode(n.context_expr))
+
+    def target(e, writing):
+        if isinstance(e, ast.Name) and e.id in handles:
+            k, mode = handles[e.id]
+            return k if (any(c in mode for c in "wa+") == writing) else None
+        if opened(e) is not None:
+            return key(opened(e)) if (any(c in _mode(e) for c in "wa+") == writing) else None
+        if isinstance(e, ast.Call) and _call_name(e) in ("read_text", "read_bytes", "read") and not writing:
+            recv = e.func.value if isinstance(e.func, ast.Attribute) else None
+            if recv is not None:
+                return handles[recv.id][0] if isinstance(recv, ast.Name) and recv.id in handles else key(recv)
+        return None
+
+    def dumps(e):
+        return any(isinstance(m, ast.Call) and _call_name(m) == "dumps" for m in _walk(e))
+    reads, writes = set(), set()
+    for n in nodes:
+        if not isinstance(n, ast.Call):
+            continue
+        name = _call_name(n)
+        if name in ("load", "loads") and n.args:
+            k = target(n.args[0], False)
+            if k:
+                reads.add(k)
+        elif name == "dump" and len(n.args) > 1:
+            k = target(n.args[1], True)
+            if k:
+                writes.add(k)
+        elif name in ("write_text", "write_bytes") and isinstance(n.func, ast.Attribute) and any(
+                dumps(a) for a in n.args):
+            writes.add(key(n.func.value))
+        elif name == "write" and isinstance(n.func, ast.Attribute) and any(dumps(a) for a in n.args):
+            k = target(n.func.value, True)
+            if k:
+                writes.add(k)
+    for n in nodes:
+        if not (isinstance(n, ast.Call) and _call_name(n) in ("replace", "rename")):
+            continue
+        if isinstance(n.func, ast.Name) or ast.unparse(n.func.value) == "os":
+            pair = n.args[:2] if len(n.args) >= 2 else None
+        else:
+            pair = [n.func.value, n.args[0]] if len(n.args) == 1 else None
+        if pair and key(pair[0]) in writes:
+            writes.add(key(pair[1]))
+    return reads, writes
+
+
+def _persists(call, carries):
+    name = _call_name(call)
+    if name in ("execute", "executemany") and call.args:
+        sql = _sql_text(call.args[0])
+        return bool(sql and _LINK_SQL.search(sql)) and any(carries(a) for a in call.args[1:])
+    if name in ("write_text", "write_bytes", "dump", "write"):
+        return any(carries(a) for a in call.args)
+    return False
+
+
+def uncached_key(trees, production=default_production):
+    """A kept copy that no change to its source reaches: a cache over files or subprocesses keyed without an mtime
+    or version, a JSON cache written back with no lock, and a process-lifetime cache whose value is persisted."""
+    prod = _prod(trees, production)
+    out = []
+    memo = set()
+    for rel, tree in prod.items():
+        scopes = list(_scopes(tree))
+        readers = {name.rsplit(".", 1)[-1] for name, fn in scopes if _reads_source(fn)}
+        for name, fn in scopes:
+            cached = _cache_deco(fn)
+            stamped = any(_STAMP.search(p) for p in _params(fn))
+            if (cached or _memo_global(fn)) and not stamped:
+                memo.add(name.rsplit(".", 1)[-1])
+            if cached and not stamped and _reads_source(fn, readers - {name.rsplit(".", 1)[-1]}):
+                out.append(Hit(f"{rel}:{name}", fn.lineno, "a cache over a file or a subprocess keyed without an "
+                               "mtime or version: the source changes and the cache keeps the old answer"))
+        rmw = {name: (fn,) + _json_rmw(fn) for name, fn in scopes}
+        read_where = {}
+        for name, (fn, reads, _) in rmw.items():
+            for k in reads:
+                read_where.setdefault(k, []).append(fn)
+        for name, (fn, _, writes) in rmw.items():
+            shared = [k for k in writes if k in read_where]
+            if shared and not _locks(fn) and not any(_locks(r) for k in shared for r in read_where[k]):
+                out.append(Hit(f"{rel}:{name}", fn.lineno, "a JSON file read and written back with no lock: two "
+                               "writers each drop the other's entries"))
+    for rel, tree in prod.items():
+        for name, fn in _bodies(tree):
+            if name.rsplit(".", 1)[-1] in memo:
+                continue
+            nodes = _own(fn)
+            tainted = set()
+
+            def carries(e):
+                return any((isinstance(m, ast.Call) and _call_name(m) in memo)
+                           or (isinstance(m, ast.Name) and m.id in tainted) for m in _walk(e))
+            for n in nodes:
+                if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None and carries(n.value):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name)}
+            hit = next((n for n in nodes if isinstance(n, ast.Call) and _persists(n, carries)), None)
+            if hit is not None:
+                out.append(Hit(f"{rel}:{name}", hit.lineno, "a value cached for the life of the process written to "
+                               "durable storage: a long-lived process writes back what was true when it started"))
+    return out
+
+
 DETECTORS = {
+    "unscoped_query": unscoped_query,
+    "stored_pid_liveness": stored_pid_liveness,
+    "uncached_key": uncached_key,
     "commit_then_link": commit_then_link,
     "torn_append": torn_append,
     "orphanable_child": orphanable_child,
@@ -1059,7 +1431,7 @@ DETECTORS = {
 
 
 def run(trees, index, production=default_production, detectors=None, config=None):
-    """`config` maps a detector name to the keyword arguments a consumer supplies it (committers, tables)."""
+    """`config` maps a detector name to the keyword arguments a consumer supplies it (committers, tables, columns)."""
     table = {**DETECTORS, **(detectors or {})}
     config = config or {}
     out = {}

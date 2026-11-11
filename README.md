@@ -79,7 +79,11 @@ is the same check as a plain assertion.
 A detector that needs repo knowledge takes it from `Registry(detector_config={name: kwargs})`.
 `commit_then_link` finds committing helpers by their `conn.commit()`; name others with
 `{"commit_then_link": {"committers": ("put",)}}`. `terminal_without_reader` gets `Registry.moves` unless
-`detector_config` gives it `tables`, and otherwise reads the declared `MOVES` literals. An exempt loop or child is a
+`detector_config` gives it `tables`, and otherwise reads the declared `MOVES` literals. `unscoped_query` finds nothing
+until it is told the scope: `{"unscoped_query": {"columns": ("machine_id",), "tables": ("jobs",), "helpers": ("_here",),
+"null_helper": "app/scope.py:here"}}`; a table whose CREATE TABLE names a scope column is scoped without being listed,
+and uppercase SQL keywords are what mark a string as a query. `stored_pid_liveness` finds a helper that only does
+`os.kill(pid, 0)`; name others with `{"stored_pid_liveness": {"alive": ("running",)}}`. An exempt loop or child is a
 waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
 existing hits go in its backlog.
 

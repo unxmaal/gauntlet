@@ -508,3 +508,121 @@ def test_run_hands_a_detector_its_configuration():
     assert detectors.run(trees, index) == {"c": []}
     got = detectors.run(trees, index, config={"commit_then_link": {"committers": ("put",)}})
     assert [h.site for h in got["c"]] == ["app/r.py:f"]
+
+
+_SCHEMA = ("SCHEMA = \"\"\"CREATE TABLE jobs (id INTEGER PRIMARY KEY, machine_id INTEGER, argv TEXT);\n"
+           "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\"\"\"\n")
+_SCOPE = {"columns": ("machine_id",), "helpers": ("_here",), "null_helper": "app/scope.py:here"}
+
+
+def scoped_sites(files, **config):
+    return sorted({h.site for h in detectors.unscoped_query(detectors.parse(files), **{**_SCOPE, **config})})
+
+
+def test_a_query_on_a_scoped_table_with_no_scope_and_a_stray_null_meaning_are_found():
+    bad = {"app/schema.py": _SCHEMA,
+           "app/q.py": ("def pending(conn):\n    return conn.execute(\"SELECT id FROM jobs WHERE argv = ?\").fetchall()\n"
+                        "def claim(conn, where):\n    conn.execute(f\"UPDATE jobs SET argv = '' WHERE {where}\")\n"
+                        "def mine(conn, m):\n    return conn.execute(\"SELECT id FROM leases WHERE machine_id = ? \"\n"
+                        "                        \"OR machine_id IS NULL\", (m,)).fetchall()\n")}
+    assert scoped_sites(bad) == ["app/q.py:claim:jobs", "app/q.py:mine:null-scope", "app/q.py:pending:jobs"]
+    assert scoped_sites(bad, tables=("leases",)) == scoped_sites(bad)
+    assert "app/q.py:pending:jobs" in scoped_sites({"app/q.py": bad["app/q.py"]}, tables=("jobs",))
+    assert scoped_sites({"app/q.py": bad["app/q.py"]}) == ["app/q.py:mine:null-scope"]
+
+
+def test_a_scoped_by_id_or_unshared_query_and_the_one_null_helper_are_left_alone():
+    innocent = {
+        "app/schema.py": _SCHEMA,
+        "app/scope.py": "def here(m):\n    return f\"(machine_id = {m} OR machine_id IS NULL)\"\n",
+        "app/q.py": ("from app.scope import here as _here\n"
+                     "def a(conn, m):\n    return conn.execute(\"SELECT id FROM jobs WHERE machine_id = ?\", (m,))\n"
+                     "def b(conn, m):\n    return conn.execute(f\"SELECT id FROM jobs WHERE {_here(m)}\")\n"
+                     "def c(conn, i):\n    return conn.execute(\"SELECT argv FROM jobs WHERE id = ?\", (i,))\n"
+                     "def d(conn):\n    return conn.execute(\"SELECT body FROM notes\")\n"
+                     "def e(conn, m):\n    conn.execute(\"INSERT INTO jobs (machine_id, argv) VALUES (?, '')\", (m,))\n"
+                     "def f(conn, m):\n    return conn.execute(\"SELECT id FROM jobs WHERE \" + _here(m))\n"
+                     "def g():\n    return \"select a job from jobs\"\n")}
+    bad = {"app/r.py": "def h(conn):\n    return conn.execute(\"DELETE FROM jobs WHERE argv = ''\")\n"}
+    assert scoped_sites(innocent) == []
+    assert scoped_sites({**innocent, **bad}) == ["app/r.py:h:jobs"]
+    assert detectors.unscoped_query(detectors.parse({**innocent, **bad})) == []
+    moved = {**innocent, "app/r.py": "def h(m):\n    return f\"machine_id = {m} OR machine_id IS NULL\"\n"}
+    assert scoped_sites(moved) == ["app/r.py:h:null-scope"]
+
+
+_ALIVE = "import os\ndef alive(pid):\n    try:\n        os.kill(pid, 0)\n    except OSError:\n        return False\n    return True\n"
+
+
+def test_a_stored_pid_checked_only_for_liveness_is_found():
+    bad = {"app/lease.py": ("import os, json\n"
+                            "def holder_alive(path):\n    rec = json.loads(path.read_text())\n    try:\n"
+                            "        os.kill(rec[\"pid\"], 0)\n    except ProcessLookupError:\n        return False\n"
+                            "    return True\n"),
+           "app/wq.py": _ALIVE + ("def settle(conn):\n    for row in conn.execute(\"SELECT pid FROM leases\"):\n"
+                                  "        if not alive(row[0]):\n            conn.execute(\"DELETE FROM leases\")\n"),
+           "app/d.py": ("from lib import wq\ndef switching(p):\n    pid = int(p.read_text())\n"
+                        "    return wq.running(pid)\n"),
+           "app/deploy.py": ("import json\nfrom app import wq\n"
+                             "def _read(p):\n    return json.loads(p.read_text())\n"
+                             "def settle(p, alive=wq.alive):\n    rec = _read(p)\n"
+                             "    if rec.get(\"pid\") and alive(int(rec[\"pid\"])):\n        return None\n")}
+    assert sites(detectors.stored_pid_liveness, bad) == ["app/deploy.py:settle", "app/lease.py:holder_alive",
+                                                          "app/wq.py:settle"]
+    got = detectors.stored_pid_liveness(detectors.parse(bad), alive=("running",))
+    assert sorted(h.site for h in got) == ["app/d.py:switching", "app/deploy.py:settle", "app/lease.py:holder_alive",
+                                           "app/wq.py:settle"]
+
+
+def test_an_own_or_child_pid_or_one_checked_against_a_second_identity_is_left_alone():
+    innocent = {"app/wq.py": _ALIVE + (
+        "import subprocess, json\n"
+        "def me():\n    return alive(os.getpid())\n"
+        "def child(argv):\n    proc = subprocess.Popen(argv)\n    return alive(proc.pid)\n"
+        "def leads(path):\n    rec = json.loads(path.read_text())\n"
+        "    return alive(rec[\"pid\"]) and os.getpgid(rec[\"pid\"]) == rec[\"pgid\"]\n"
+        "def same(path, started):\n    rec = json.loads(path.read_text())\n"
+        "    return alive(rec[\"pid\"]) and rec[\"start_time\"] == started\n"
+        "def _leads(pid):\n    return os.getpgid(pid) == pid\n"
+        "def _pid_of(path):\n    pid = int(path.read_text())\n    return pid if alive(pid) and _leads(pid) else None\n"
+        "def get(path):\n    return json.loads(path.read_text())\n"
+        "def ended(holder):\n    pid = holder.get(\"pid\")\n    return not alive(int(pid))\n")}
+    bad = {"app/x.py": "import os\ndef f(p):\n    os.kill(int(open(p).read()), 0)\n"}
+    quiet_then_fires(detectors.stored_pid_liveness, innocent, bad)
+
+
+def test_an_unkeyed_file_cache_an_unlocked_json_cache_and_a_persisted_process_cache_are_found():
+    bad = {"app/m.py": (
+        "import functools, json, subprocess\n"
+        "@functools.lru_cache(maxsize=4)\ndef cases(root):\n    return (root / \"cases.txt\").read_text().split()\n"
+        "@functools.cache\ndef versions():\n"
+        "    return subprocess.run([\"llama-server\", \"--version\"], capture_output=True).stdout\n"
+        "def remember(conn, m):\n    v = versions()\n"
+        "    conn.execute(\"UPDATE machines SET versions = ? WHERE id = ?\", (v, m))\n"
+        "def digests(home):\n    path = home / \"cache\" / \"digests.json\"\n"
+        "    got = json.loads(path.read_text())\n    got[\"x\"] = 1\n    path.write_text(json.dumps(got))\n")}
+    assert sites(detectors.uncached_key, bad) == ["app/m.py:cases", "app/m.py:digests", "app/m.py:remember",
+                                                  "app/m.py:versions"]
+
+
+def test_a_stamped_cache_a_locked_json_cache_and_an_unpersisted_cache_are_left_alone():
+    innocent = {"app/m.py": (
+        "import functools, json, fcntl\n"
+        "@functools.lru_cache\ndef cases(root, mtime):\n    return (root / \"cases.txt\").read_text().split()\n"
+        "@functools.cache\ndef table():\n    return {\"a\": 1}\n"
+        "def show():\n    print(table())\n"
+        "_PATH = \"cache.json\"\n"
+        "def load():\n    with open(_PATH) as f:\n        return json.load(f)\n"
+        "def save(d):\n    with open(_PATH, \"w\") as f:\n        fcntl.flock(f, fcntl.LOCK_EX)\n"
+        "        json.dump(d, f)\n"
+        "def once(p, d):\n    p.write_text(json.dumps(d))\n"
+        "_THIS = None\n"
+        "def this():\n    global _THIS\n    if _THIS is None:\n        _THIS = probe()\n    return _THIS\n"
+        "def report():\n    print(this())\n")}
+    bad = {"app/n.py": "from app.m import this\ndef keep(path):\n    path.write_text(this())\n"}
+    quiet_then_fires(detectors.uncached_key, innocent, bad)
+    torn = {"app/o.py": ("import json, os\n"
+                         "def load():\n    with open(\"c.json\") as f:\n        return json.load(f)\n"
+                         "def save(d):\n    with open(\"c.json.tmp\", \"w\") as f:\n        json.dump(d, f)\n"
+                         "    os.replace(\"c.json.tmp\", \"c.json\")\n")}
+    assert sites(detectors.uncached_key, {**innocent, **torn}) == ["app/o.py:save"]
