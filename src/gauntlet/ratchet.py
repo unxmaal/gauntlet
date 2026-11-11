@@ -2,7 +2,7 @@
 
 import re
 
-from gauntlet import detectors, registry, review, skill
+from gauntlet import detectors, moves, registry, review, skill
 
 _ORDINARY = ["import os", "from pkg import paths", "def f(a, b=None):", "    return x", "    if not rows:",
              "for r in rows:", "    out.append(r)", "class Thing:", "    \"\"\"One line of prose.\"\"\"",
@@ -81,6 +81,13 @@ def stale(reg, led, marks):
     return out
 
 
+def move_registration(reg):
+    kw = {"production": reg.production, "is_test": reg.tests, "lister": reg.files}
+    trees = detectors.parse(detectors.sources(reg.root, **kw))
+    sites = [h.site for h in detectors.move_tables(trees, reg.production)]
+    return moves.unregistered(sites, reg.moves, reg.move_waivers)
+
+
 def tests(reg, extra_detectors=None, skill_dir=None):
     """Test functions for a consumer's module: globals().update(gauntlet.ratchet.tests(REGISTRY))."""
     cache = {}
@@ -89,6 +96,12 @@ def tests(reg, extra_detectors=None, skill_dir=None):
         if "led" not in cache:
             cache["led"] = tree_ledger(reg, extra_detectors)
         return cache["led"]
+
+    def test_gauntlet_every_move_table_is_sound():
+        moves.assert_sound(reg.moves)
+
+    def test_gauntlet_every_move_table_is_registered():
+        fail_on(move_registration(reg))
 
     def fail_on(problems):
         assert not problems, "\n  ".join(["gauntlet:"] + problems)

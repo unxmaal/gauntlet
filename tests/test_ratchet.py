@@ -74,7 +74,7 @@ def _failing(reg, skill_dir, **kw):
 
 def test_a_clean_consumer_passes_every_ratchet(consumer):
     assert _failing(*consumer) == []
-    assert len(ratchet.tests(consumer[0])) == 8
+    assert len(ratchet.tests(consumer[0])) == 10
 
 
 def test_an_unbound_hit_fails_until_it_is_bound_waived_or_in_the_backlog(consumer):

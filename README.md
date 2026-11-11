@@ -59,6 +59,23 @@ globals().update(gauntlet.ratchet.tests(REGISTRY))
 Bind a detector hit to a test with `@pytest.mark.gauntlet("class-id", site="path:NAME")`; the package registers
 the marker. Repo-specific detectors go in `tests(REGISTRY, extra_detectors={...})`.
 
+Declared move tables go in `Registry(moves=(...))`, one `gauntlet.moves.MoveTable` each:
+
+```python
+from gauntlet.moves import MoveTable, reopens_by
+from app import job_state as j
+
+MoveTable("app/job_state.py:MOVES", j.MOVES, initial=[j.PENDING], terminal=[j.DONE, j.FAILED],
+          reopens=reopens_by(j.MOVES, {j.REFETCH}), states=j.STATES)
+```
+
+`moves` accepts `{state: next_states}`, `{(leaves, enters): reasons_or_writers}` or a set of `(leaves, enters)`
+pairs; `moves.merge(...)` unions per-writer tables. The ratchet then fails on an unreachable state, a non-terminal
+dead end, a terminal that moves by anything but a named reopen, and a declared or used state the table never names.
+It also fails on any module constant named `MOVES`, `TRANSITIONS` or `*_MOVES` holding such pairs that has no
+`MoveTable` and no reason in `Registry(move_waivers={site: why})`. Without a Registry, `moves.assert_sound(tables)`
+is the same check as a plain assertion.
+
 The CLI takes the same object:
 
     gauntlet audit --registry tests.gauntlet.registry:REGISTRY [--offline]

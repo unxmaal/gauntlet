@@ -35,6 +35,8 @@ class Registry:
     tests: Callable[[str], bool] = lambda rel: rel.startswith("tests/") and "/fixtures/" not in rel
     code_paths: str = review.CODE_PATHS
     files: Callable[[Path], list] | None = None
+    moves: tuple = ()
+    move_waivers: dict = field(default_factory=dict)
 
     def snapshot(self):
         return skill.load_snapshot(self.snapshot_file)

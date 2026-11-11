@@ -294,6 +294,13 @@ def test_a_key_built_from_a_row_position_is_found():
     quiet_then_fires(detectors.row_index_keys, innocent, bad)
     assert sites(detectors.row_index_keys, bad) == ["app/q.py:g"]
 
+def test_a_declared_move_table_is_found():
+    innocent = {"app/m.py": 'STATES = ("a", "b")\nFAMILY = {"a": 1}\nREMOVES = {("a", "b")}\n'}
+    bad = {"app/n.py": 'A = "a"\nMOVES = frozenset({(None, A), (A, "b")})\n'}
+    quiet_then_fires(detectors.move_tables, innocent, bad)
+    assert sites(detectors.move_tables, {**innocent, **bad}) == ["app/n.py:MOVES"]
+
+
 def test_every_detector_has_a_fixture_here():
     text = open(__file__, encoding="utf-8").read()
     assert [name for name in detectors.DETECTORS if f"detectors.{name}" not in text] == []

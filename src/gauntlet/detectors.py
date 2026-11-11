@@ -452,7 +452,55 @@ def row_index_keys(trees, production=default_production):
     return out
 
 
+_MOVE_NAME = re.compile(r"_?(?:[A-Z0-9_]*_)?(?:MOVES|TRANSITIONS)")
+
+
+def _state_ref(node):
+    return (isinstance(node, ast.Constant) and (node.value is None or isinstance(node.value, str))) or isinstance(
+        node, (ast.Name, ast.Attribute))
+
+
+def _state_pair(node):
+    return isinstance(node, ast.Tuple) and len(node.elts) == 2 and all(_state_ref(e) for e in node.elts)
+
+
+def _unwrap(value):
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id in ("frozenset", "set", "dict") and len(value.args) == 1 and not value.keywords):
+        return value.args[0]
+    return value
+
+
+def _setlike(node):
+    empty = (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("frozenset", "set")
+             and not node.args)
+    return empty or isinstance(_unwrap(node), (ast.Set, ast.List, ast.Tuple))
+
+
+def _move_shaped(value):
+    value = _unwrap(value)
+    if isinstance(value, (ast.Set, ast.List, ast.Tuple)):
+        return bool(value.elts) and all(_state_pair(e) for e in value.elts)
+    if isinstance(value, ast.Dict):
+        keys = [k for k in value.keys if k is not None]
+        if keys and all(_state_pair(k) for k in keys):
+            return True
+        return bool(keys) and all(_state_ref(k) for k in keys) and all(_setlike(v) for v in value.values)
+    return False
+
+
+def move_tables(trees, production=default_production):
+    """Module constants named like a move table whose value is a set of (leaves, enters) pairs or a table of them."""
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        for name, value, line in _assign_targets(tree):
+            if _MOVE_NAME.fullmatch(name) and _move_shaped(value):
+                out.append(Hit(f"{rel}:{name}", line, "a declared move table"))
+    return out
+
+
 DETECTORS = {
+    "move_tables": move_tables,
     "row_index_keys": row_index_keys,
     "closed_tables": closed_tables,
     "latest_row_state": latest_row_state,
