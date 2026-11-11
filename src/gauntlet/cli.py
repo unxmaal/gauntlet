@@ -1,4 +1,4 @@
-"""gauntlet {classes,corpus-dir,inventory,audit,review,snapshot-skill,snapshot-defects,mutation}."""
+"""gauntlet {classes,corpus-dir,inventory,scan,import,audit,review,snapshot-skill,snapshot-defects,mutation}."""
 
 import argparse
 import importlib
@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from gauntlet import inventory, mutation, registry, review, skill
+from gauntlet import adapters, findings, frontends, inventory, mutation, registry, review, skill
 
 REGISTRY_ENV = "GAUNTLET_REGISTRY"
 
@@ -54,6 +54,38 @@ def cmd_inventory(a):
     problems = inventory.check_files(a.files, a.skill_dir)
     print("\n".join(problems) if problems else f"{len(a.files)} inventory file(s) in the standard format")
     return 1 if problems else 0
+
+
+def _emit(found, a):
+    text = findings.render(found, a.format)
+    if a.output:
+        Path(a.output).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_scan(a):
+    reg = load_object(a.registry) if a.registry else None
+    root = Path(a.root) if a.root else (reg.root if reg else Path.cwd())
+    names = a.frontend or (list(reg.frontends) if reg else ["python"])
+    config = None
+    if reg:
+        from gauntlet import ratchet
+        config = ratchet.detector_config(reg)
+    found = []
+    for name in names:
+        fe = frontends.get(name, reg.production if reg else registry.default_production)
+        found += fe.scan(root, fe.discover(root, lister=reg.files if reg else None), reg.index if reg else None, config)
+    _emit(sorted(set(found)), a)
+    return 1 if found and a.fail else 0
+
+
+def cmd_import(a):
+    found = []
+    for path in a.files:
+        found += adapters.load(a.tool, Path(path).read_text(encoding="utf-8"))
+    _emit(sorted(set(found)), a)
+    return 0
 
 
 def cmd_audit(a):
@@ -117,6 +149,20 @@ def main(argv=None):
     iv.add_argument("files", nargs="+")
     iv.add_argument("--skill-dir", help="where shapes.md lives (default: the corpus this version ships)")
     iv.set_defaults(fn=cmd_inventory)
+    sc = sub.add_parser("scan", help="run front ends over a repo and print findings as JSON or SARIF")
+    sc.add_argument("root", nargs="?", help="default: the registry's root, else the working directory")
+    sc.add_argument("--frontend", action="append", choices=("python", "hcl"),
+                    help="repeatable (default: the registry's frontends, else python)")
+    sc.add_argument("--registry", help="package.module:ATTR; its index names the classes, else detector defaults")
+    sc.add_argument("--fail", action="store_true", help="exit 1 when anything is found")
+    im = sub.add_parser("import", help="read a linter's JSON output as findings")
+    im.add_argument("tool", choices=sorted(adapters.ADAPTERS))
+    im.add_argument("files", nargs="+")
+    for s in (sc, im):
+        s.add_argument("--format", choices=("json", "sarif"), default="json")
+        s.add_argument("--output", help="write here instead of stdout")
+    sc.set_defaults(fn=cmd_scan)
+    im.set_defaults(fn=cmd_import)
     for name, fn, text in (("audit", cmd_audit, "closed defects with no class, and the registry's numbers"),
                            ("review", cmd_review, "the review questions a diff raises, for classes no detector finds"),
                            ("snapshot-skill", cmd_snapshot_skill, "regenerate the registry's skill snapshot"),
