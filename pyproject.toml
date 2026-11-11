@@ -12,6 +12,11 @@ gauntlet = "gauntlet.cli:main"
 [project.entry-points.pytest11]
 gauntlet = "gauntlet.pytest_plugin"
 
+[project.optional-dependencies]
+hcl = [
+    "python-hcl2>=8.2.0",
+]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 

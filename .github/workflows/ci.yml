@@ -12,7 +12,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Tests
-        run: uv run pytest -q
+        run: uv run --all-extras pytest -q
+      - name: Tests without the hcl extra
+        run: uv run --exact pytest -q
       - name: Install the built wheel in a fresh venv
         run: |
           set -euo pipefail

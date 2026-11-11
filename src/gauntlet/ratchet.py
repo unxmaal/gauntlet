@@ -2,7 +2,7 @@
 
 import re
 
-from gauntlet import detectors, moves, registry, review, skill
+from gauntlet import detectors, frontends, moves, registry, review, skill
 
 _ORDINARY = ["import os", "from pkg import paths", "def f(a, b=None):", "    return x", "    if not rows:",
              "for r in rows:", "    out.append(r)", "class Thing:", "    \"\"\"One line of prose.\"\"\"",
@@ -29,7 +29,7 @@ def duplicate_ids(reg):
 
 
 def unknown_detectors(reg, extra=None):
-    known = {**detectors.DETECTORS, **(extra or {})}
+    known = {*frontends.detector_names(reg.frontends), *detectors.DETECTORS, *(extra or {})}
     out = [f"{cid}: detector {e['detector']} does not exist" for cid, e in reg.index.items()
            if e.get("detector") and e["detector"] not in known]
     return out + [f"detector_config names {name}, which does not exist" for name in sorted(reg.detector_config)
@@ -56,10 +56,24 @@ def review_gaps(reg):
     return out
 
 
+def frontend_hits(reg, extra=None):
+    """{class: [Hit]} from every front end the registry names, each class seeded so a silent detector still counts."""
+    config = detector_config(reg)
+    out = {}
+    for name in reg.frontends:
+        fe = frontends.get(name, reg.production, extra)
+        known = fe.detectors()
+        for cid, e in reg.index.items():
+            if e.get("detector") in known:
+                out.setdefault(cid, {})
+        for f in fe.scan(reg.root, fe.discover(reg.root, lister=reg.files), reg.index, config):
+            out.setdefault(f.cls, {}).setdefault(f.site, detectors.Hit(f.site, f.line, f.why))
+    return {cid: sorted(hits.values()) for cid, hits in out.items()}
+
+
 def tree_ledger(reg, extra=None):
     kw = {"production": reg.production, "is_test": reg.tests, "lister": reg.files}
-    trees = detectors.parse(detectors.sources(reg.root, **kw))
-    hits = detectors.run(trees, reg.index, reg.production, extra, detector_config(reg))
+    hits = frontend_hits(reg, extra)
     marks = detectors.bindings(detectors.sources(reg.root, tests=True, **kw), reg.tests)
     return detectors.ledger(hits, marks, reg.index), marks
 

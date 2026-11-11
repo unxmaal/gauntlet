@@ -38,6 +38,7 @@ class Registry:
     moves: tuple = ()
     move_waivers: dict = field(default_factory=dict)
     detector_config: dict = field(default_factory=dict)
+    frontends: tuple = ("python",)
 
     def snapshot(self):
         return skill.load_snapshot(self.snapshot_file)
