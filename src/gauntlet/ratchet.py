@@ -105,11 +105,14 @@ def stale(reg, led, marks):
     return out
 
 
-def move_registration(reg):
+def move_sites(reg):
     kw = {"production": reg.production, "is_test": reg.tests, "lister": reg.files}
     trees = detectors.parse(detectors.sources(reg.root, **kw))
-    sites = [h.site for h in detectors.move_tables(trees, reg.production)]
-    return moves.unregistered(sites, reg.moves, reg.move_waivers)
+    return sorted({h.site for h in detectors.move_tables(trees, reg.production)})
+
+
+def move_registration(reg):
+    return moves.unregistered(move_sites(reg), reg.moves, reg.move_waivers)
 
 
 def tests(reg, extra_detectors=None, skill_dir=None):

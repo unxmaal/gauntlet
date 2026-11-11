@@ -16,14 +16,28 @@ The skill: symlink the skill directory to this checkout's corpus.
 
 The package, pinned to a tag:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.1.0"
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.0"
     gauntlet classes          # the corpus this version ships
     gauntlet corpus-dir       # where it lives
 
 The installed package carries its own copy of the corpus, so a consumer's tests read the pinned version and not
 whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
-## Wiring a consumer's registry
+## Wiring a repo with `gauntlet init`
+
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.0" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+
+In a Python repo it adds the dev-dependency pin to `pyproject.toml` (with `python_version >= '3.12'` when
+`requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`, `tests/test_gauntlet.py`, the
+skill snapshot, an empty defects snapshot and a backlog of today's hits, so the first run passes and only a new hit
+fails. The index holds every corpus class a detector covers; `hcl` joins the front ends when the repo has `.tf`
+files. What init cannot know (production paths, `detector_config` values, move tables) is a `# TODO(gauntlet):` line
+in the registry. It refuses to overwrite a registry without `--force`. A Terraform repo with no `pyproject.toml`
+gets the minimal form instead: `.gauntlet/baseline.json` and `.gauntlet/check.sh`, which runs
+`gauntlet scan --frontend hcl --baseline .gauntlet/baseline.json` and fails on a finding not in the baseline.
+`corpus/INSTALL.md` is the same as a runbook, step by step.
+
+## Wiring a consumer's registry by hand
 
 The registry stays in the consumer's repo: class instances, waivers, the detector backlog, the defects snapshot
 and what counts as production code. Describe it once:

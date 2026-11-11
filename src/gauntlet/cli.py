@@ -1,4 +1,4 @@
-"""gauntlet {classes,corpus-dir,inventory,scan,import,audit,review,snapshot-skill,snapshot-defects,mutation}."""
+"""gauntlet {init,classes,corpus-dir,inventory,scan,import,audit,review,snapshot-skill,snapshot-defects,mutation}."""
 
 import argparse
 import importlib
@@ -76,8 +76,33 @@ def cmd_scan(a):
     for name in names:
         fe = frontends.get(name, reg.production if reg else registry.default_production)
         found += fe.scan(root, fe.discover(root, lister=reg.files if reg else None), reg.index if reg else None, config)
-    _emit(sorted(set(found)), a)
+    found = sorted(set(found))
+    if a.baseline:
+        return _against_baseline(found, a)
+    _emit(found, a)
     return 1 if found and a.fail else 0
+
+
+def _against_baseline(found, a):
+    known = {(f.cls, f.site) for f in findings.from_json(Path(a.baseline).read_text(encoding="utf-8"))}
+    new = [f for f in found if (f.cls, f.site) not in known]
+    gone = sorted(known - {(f.cls, f.site) for f in found})
+    _emit(new, a)
+    for cls, site in gone:
+        print(f"gone since the baseline, drop it from {a.baseline}: {cls} {site}", file=sys.stderr)
+    return 1 if new else 0
+
+
+def cmd_init(a):
+    from gauntlet import init
+    written, todos, backlog, notes = init.run(a.root, a.pin, a.force)
+    for rel in written:
+        print(f"wrote {rel}")
+    print(f"backlog: {backlog} hit(s) seeded")
+    print(f"TODO lines: {todos}" + (f" in {init.REGISTRY_REL}: ask the user before filling any" if todos else ""))
+    for note in notes:
+        print(f"note: {note}")
+    return 0
 
 
 def cmd_import(a):
@@ -140,6 +165,11 @@ def main(argv=None):
         return mutation.main(load_object(rest[1]), rest[2:])
     p = argparse.ArgumentParser(prog="gauntlet")
     sub = p.add_subparsers(dest="cmd", required=True)
+    it = sub.add_parser("init", help="wire this repo: pin, registry, ratchet tests, snapshots, a seeded backlog")
+    it.add_argument("--root", default=".", help="the repo to wire (default: the working directory)")
+    it.add_argument("--pin", help="the gauntlet tag to pin (default: this installed version's tag)")
+    it.add_argument("--force", action="store_true", help="rewrite an existing registry or baseline")
+    it.set_defaults(fn=cmd_init)
     cl = sub.add_parser("classes", help="the corpus's classes: tier, id, source file")
     cl.add_argument("--skill-dir", help="default: $GAUNTLET_SKILL_DIR, else the corpus this version ships")
     cl.set_defaults(fn=cmd_classes)
@@ -155,6 +185,7 @@ def main(argv=None):
                     help="repeatable (default: the registry's frontends, else python)")
     sc.add_argument("--registry", help="package.module:ATTR; its index names the classes, else detector defaults")
     sc.add_argument("--fail", action="store_true", help="exit 1 when anything is found")
+    sc.add_argument("--baseline", help="a JSON findings file: print only findings not in it, exit 1 if any")
     im = sub.add_parser("import", help="read a linter's JSON output as findings")
     im.add_argument("tool", choices=sorted(adapters.ADAPTERS))
     im.add_argument("files", nargs="+")
