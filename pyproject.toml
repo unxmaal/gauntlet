@@ -1,6 +1,6 @@
 [project]
 name = "gauntlet"
-version = "0.3.2"
+version = "0.3.3"
 description = "A corpus of logical failure classes, with the detectors, review heuristics and ratchets that hold a repo to it."
 readme = "README.md"
 requires-python = ">=3.12"
