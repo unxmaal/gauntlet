@@ -625,3 +625,26 @@ if [ "$FLAG" ]; then ...               # FLAG="false" passes (non-empty string)
 
 *(#27 "Silent truncation / partial read" was promoted into the bitten corpus in
 `SKILL.md` after it bit a review here; see that file's entry 14.)*
+
+## 28. Irreplaceable state with no guard on its destruction
+
+**Trigger:** does declarative code own something a re-run cannot rebuild: a
+database, a bucket of objects, a DNS zone whose delegation lives elsewhere, a
+volume? Can a plan destroy it, or destroy it without keeping a copy?
+
+**Tier:** 2.
+
+**Test shape:** plan a change that forces replacement (rename, a changed
+immutable argument) and assert the plan refuses. Feed every deploy var file and
+assert none makes the final-snapshot skip true.
+
+**HCL:**
+```hcl
+resource "aws_db_instance" "main" {
+  skip_final_snapshot = var.skip_snapshot   # true in one var file -> no copy
+}
+resource "aws_db_instance" "main" {
+  skip_final_snapshot = false
+  lifecycle { prevent_destroy = true }      # a replacing plan fails instead
+}
+```

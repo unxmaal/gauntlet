@@ -6,7 +6,7 @@ scanners for tier-1 classes, review heuristics for a diff, the audit, the mutati
 inventory-format check.
 
 - `corpus/`: `SKILL.md`, `general-corpus.md`, `shapes.md`, the Stop hook and its test. This is the Claude skill.
-- `src/gauntlet/`: the package. Standard library only.
+- `src/gauntlet/`: the package. Standard library only; the HCL front end needs the `hcl` extra (python-hcl2).
 
 ## Install
 
@@ -102,6 +102,38 @@ default argument at the same site, so a consumer that binds both classes binds o
 loop or child is a
 waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
 existing hits go in its backlog.
+
+## Findings, front ends and other tools' output
+
+Every front end and adapter emits one format, `{class, site, line, why, tool, rule}`, as JSON or SARIF 2.1.0, so
+code scanning can show it without the gauntlet installed:
+
+    gauntlet scan [ROOT] --frontend hcl --format sarif --output gauntlet.sarif
+    gauntlet scan --registry tests.gauntlet.registry:REGISTRY          # the registry's index names the classes
+    gauntlet import tflint|checkov|trivy tool-output.json --format sarif
+
+A front end is `discover(root) -> files` and `scan(root, files, index, config) -> findings`. `python` is the AST
+detectors above. `hcl` (Terraform/OpenTofu, the `gauntlet[hcl]` extra) reads `.tf`, `.tfvars`, `.tftest.hcl`, backend
+config files, lock files, and the scripts and CI files that run terraform. With no registry each detector reports
+under its default class; with one, `index[cid]["detector"]` names it. `Registry(frontends=("python", "hcl"))` puts HCL
+findings under the same ratchets: bind a site with `@pytest.mark.gauntlet(cid, site="infra/db.tf:aws_db_instance.main")`,
+waive it, or backlog it.
+
+| detector | default class | fires on |
+|---|---|---|
+| `hcl_duplicated_literal` | one-question-two-answers | a CIDR, region, account id, domain or name in two .tf/.tfvars files |
+| `hcl_env_two_inputs` | a-non-production-run-writes-live-state | backend chosen at init, env by -var-file, no condition ties them (`ties`) |
+| `hcl_shared_backend` | a-non-production-run-writes-live-state | two roots with one backend key, or one backend file split only by a CLI key |
+| `hcl_stateful_unprotected` | irreplaceable-state-with-no-guard-on-its-destruction | a stateful resource with no `prevent_destroy`, or `skip_final_snapshot` reachable as true (`stateful`) |
+| `hcl_count_by_position` | identity-by-name-not-by-content | `count.index` into a data source list |
+| `hcl_lock_missing` | external-state-with-no-assertion-on-it | a root module whose `.terraform.lock.hcl` is missing or git-ignored |
+| `hcl_constant_assert` | a-metric-quoted-without-a-negative-control | a test assert whose operands are only constants and variables |
+| `hcl_test_skips_tfvars` | a-proxy-checked-in-place-of-the-property | a test that names an env whose tfvars nothing passes to `terraform test` |
+| `hcl_unchecked_external` | external-state-with-no-assertion-on-it | an output copied out of band (`copied`, default `name_servers`) with no check |
+| `hcl_order_in_prose` | an-order-the-code-needs-but-does-not-check | an apply order stated only in a description or comment |
+
+A file python-hcl2 cannot parse is a `hcl_unparsed` finding, not a silence. The adapters map rule ids to classes in
+`gauntlet.adapters.CLASSES` and keep an unmapped rule as `unclassified`. They parse the tools' JSON and never run them.
 
 The CLI takes the same object:
 
