@@ -1732,7 +1732,333 @@ def unpaired_column(trees, production=default_production, migrations=(), schema=
     return out
 
 
+
+def _names_in(node):
+    # Every identifier, attribute, argument, keyword, imported name and whole string under `node`.
+    out = set()
+    for n in _walk(node):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, (ast.arg, ast.keyword)) and n.arg:
+            out.add(n.arg)
+        elif isinstance(n, ast.ImportFrom) and n.module:
+            out.add(n.module)
+        elif _str(n) is not None:
+            out.add(_str(n))
+    return out
+
+
+def _named(func, names):
+    # The consumer name a callee or bound default matches: a bare name by its last part, a dotted one by its tail.
+    if not isinstance(func, (ast.Name, ast.Attribute)):
+        return None
+    text = ast.unparse(func)
+    last = text.rsplit(".", 1)[-1]
+    return next((n for n in names if (n == last if "." not in n else text == n or text.endswith("." + n))), None)
+
+
+def _mentions(node, names):
+    return any((isinstance(n, ast.Name) and n.id in names) or (isinstance(n, ast.Attribute) and n.attr in names)
+               for n in _walk(node))
+
+
+def _module_defs(tree):
+    defs = {}
+    for _, fn in _scopes(tree):
+        defs.setdefault(fn.name, fn)
+    return defs
+
+
+def _closure(defs, start):
+    # `start` and every function of its module it reaches by a bare-name call, transitively.
+    seen, todo = {}, [start]
+    while todo:
+        node = todo.pop()
+        if id(node) in seen:
+            continue
+        seen[id(node)] = node
+        todo.extend(defs[n.func.id] for n in _walk(node)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in defs)
+    return list(seen.values())
+
+
+def _main_block(tree):
+    return next((s for s in tree.body if isinstance(s, ast.If) and "__name__" in ast.unparse(s.test)
+                 and "__main__" in ast.unparse(s.test)), None)
+
+
+def _entry_points(tree, rel, names):
+    # (qualname, node) for each function `names` lists bare or as "path:qualname", and "__main__" for the main block.
+    for qual, fn in _scopes(tree):
+        if qual in names or fn.name in names or f"{rel}:{qual}" in names:
+            yield qual, fn
+    main = _main_block(tree) if "__main__" in names or f"{rel}:__main__" in names else None
+    if main is not None:
+        yield "__main__", main
+
+
+_ORDERING = {ast.Lt: "<", ast.LtE: "<", ast.Gt: ">", ast.GtE: ">"}
+_FLIP = {"<": ">", ">": "<"}
+
+
+def _version_aliases(fn, versions):
+    # Local names assigned from a version constant or reader, so `have = stored(conn)` carries the version too.
+    # A tuple assignment pairs element by element: `have, want = stored(c), 0` carries it to `have` only.
+    names = set(versions)
+    for _ in range(2):
+        for n in _walk(fn):
+            if not isinstance(n, ast.Assign):
+                continue
+            for t in n.targets:
+                pairs = zip(t.elts, n.value.elts) if isinstance(t, ast.Tuple) and isinstance(n.value, ast.Tuple) \
+                    and len(t.elts) == len(n.value.elts) else [(t, n.value)]
+                names |= {x.id for x, v in pairs if isinstance(x, ast.Name) and _mentions(v, names)}
+    return names
+
+
+_SAYS_ONLY = {"print", "write", "debug", "info", "warning", "warn", "error", "exception", "log", "close"}
+
+
+def _drops(node, names, skips):
+    # `if v != VERSION:` whose body only says so and leaves: a return of nothing, of a skip helper's answer, or
+    # continue; no raise and no call but logging, closing and the skip helpers.
+    if not isinstance(node, ast.If):
+        return False
+    cmps = [c for c in _walk(node.test) if isinstance(c, ast.Compare) and len(c.ops) == 1
+            and isinstance(c.ops[0], ast.NotEq) and _mentions(c, names)]
+    inside = [m for s in node.body for m in _walk(s)]
+    return bool(cmps) and not any(isinstance(m, ast.Raise) for m in inside) and all(
+        _call_name(m) in _SAYS_ONLY | skips for m in inside if isinstance(m, ast.Call)) and any(
+        (isinstance(m, ast.Return) and (_empty(m.value) or (isinstance(m.value, ast.Call)
+                                                           and _call_name(m.value) in skips)))
+        or isinstance(m, ast.Continue) for m in inside)
+
+
+def one_sided_schema_check(trees, production=default_production, versions=(), phases=(), markers=(), skips=()):
+    """A deploy that runs two releases at once: an ordering comparison against a version the consumer names
+    (`versions`, such as SCHEMA_VERSION or stored_schema) that refuses one direction of skew and lets the other
+    through; a `!=` against one that drops the work quietly (`skips` names helpers that log and return nothing); and
+    a check entry point (`phases`) that runs before and after a switch with no phase marker (`markers`, such as
+    SMOKE_PHASE) anywhere it reaches. Finds nothing until told."""
+    versions, markers, skips = set(versions), set(markers), set(skips)
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        if versions:
+            for qual, fn in _scopes(tree):
+                names = _version_aliases(fn, versions)
+                sides = {}
+                for n in _own(fn):
+                    if not (isinstance(n, ast.Compare) and len(n.ops) == 1 and _mentions(n, names)):
+                        continue
+                    left, right = ast.unparse(n.left), ast.unparse(n.comparators[0])
+                    op = _ORDERING.get(type(n.ops[0]), "=" if isinstance(n.ops[0], (ast.Eq, ast.NotEq)) else None)
+                    if op is not None:
+                        key = tuple(sorted((left, right)))
+                        sides.setdefault(key, [n.lineno, set()])[1].add(op if (left, right) == key else _FLIP.get(op, op))
+                for (a, b), (line, ops) in sorted(sides.items()):
+                    if ops in ({"<"}, {">"}):
+                        out.append(Hit(f"{rel}:{qual}:one-sided", line, f"{a} against {b} refuses one direction "
+                                       "of skew only: the other release's code passes the check"))
+                        break
+                dropped = next((n for n in _own(fn) if _drops(n, names, skips)), None)
+                if dropped is not None:
+                    out.append(Hit(f"{rel}:{qual}:drops", dropped.lineno, "a version mismatch returns nothing: the "
+                                   "other release's work is dropped, not refused or kept for later"))
+        if phases:
+            defs = _module_defs(tree)
+            for qual, node in _entry_points(tree, rel, set(phases)):
+                if not any(markers & _names_in(f) for f in _closure(defs, node)):
+                    out.append(Hit(f"{rel}:{qual}:both-phases", node.lineno, "this check runs before and after "
+                                   "the switch and nothing it reaches asks which: new code judges old services"))
+    return out
+
+
+_SPAWN_ATTRS = {"run", "Popen", "check_output", "check_call", "call", "create_subprocess_exec", "execv", "execvp",
+                "execvpe", "system", "spawnv", "spawnvp"}
+_SPAWN_MODULES = {"subprocess", "os", "asyncio"}
+_SPAWN_NAMES = {"Popen", "check_output", "check_call"}
+EFFECT_BINARIES = ("osascript", "terminal-notifier", "notify-send", "say", "afplay", "launchctl", "systemctl", "ssh",
+                   "scp", "rsync", "gh", "curl", "wget", "kill", "pkill", "killall", "docker", "brew")
+
+
+def _argv0(arg, local, consts):
+    # The program a spawn runs: the first word of a list, tuple or command string, through local or module names.
+    for _ in range(3):
+        if not isinstance(arg, ast.Name):
+            break
+        arg = local.get(arg.id, consts.get(arg.id))
+    if isinstance(arg, (ast.List, ast.Tuple)) and arg.elts:
+        arg = arg.elts[0]
+        if isinstance(arg, ast.Name):
+            arg = local.get(arg.id, consts.get(arg.id))
+    text = _str(arg) if arg is not None else None
+    return Path(text.split()[0]).name if text and text.split() else None
+
+
+def _is_spawn(n, spawners):
+    if not (isinstance(n, ast.Call) and n.args):
+        return False
+    f = n.func
+    return (isinstance(f, ast.Attribute) and f.attr in _SPAWN_ATTRS and isinstance(f.value, ast.Name)
+            and f.value.id in _SPAWN_MODULES) or (isinstance(f, ast.Name) and f.id in _SPAWN_NAMES) \
+        or bool(_named(f, spawners))
+
+
+def _effect_defaults(tree, effects):
+    # (qualname, effect, line) for each parameter whose default is an effect function: bound when the module loads.
+    for qual, fn in _scopes(tree):
+        for d in fn.args.defaults + [k for k in fn.args.kw_defaults if k is not None]:
+            name = _named(d, effects)
+            if name:
+                yield qual, name, d.lineno
+
+
+def effect_reachable(trees, production=default_production, effects=(), live=(), guarded=(), binaries=EFFECT_BINARIES,
+                     spawners=()):
+    """An effect reachable from a run that is not the live deploy: a call to an effect the consumer names (`effects`,
+    such as alert, post, push, restart) where neither the caller nor the effect's own definition consults a live-run
+    predicate (`live`); an effect bound as a default argument, out of reach of any stub; and a spawn of an effect
+    binary (`binaries`) that the test guard's list (`guarded`) lacks."""
+    prod = _prod(trees, production)
+    effects, live, guarded, binaries = tuple(effects), set(live), set(guarded), set(binaries)
+    gated = {}
+    for tree in prod.values():
+        for _, fn in _scopes(tree):
+            if _named(ast.Name(id=fn.name), effects):
+                gated[fn.name] = gated.get(fn.name, True) and bool(live & _names_in(fn))
+    out = []
+    for rel, tree in prod.items():
+        scopes = dict(_scopes(tree))
+        owner = _innermost(tree)
+        consts = {name: v for name, v, _ in _assign_targets(tree)}
+        locals_ = {qual: {t.id: s.value for s in _own(fn) if isinstance(s, ast.Assign) for t in s.targets
+                          if isinstance(t, ast.Name)} for qual, fn in scopes.items()}
+        found = {}
+        for n in _walk(tree):
+            qual = owner.get(id(n), "<module>")
+            name = _named(n.func, effects) if isinstance(n, ast.Call) else None
+            if name:
+                fn = scopes.get(qual)
+                if not (gated.get(name.rsplit(".", 1)[-1]) or (fn is not None and live & _names_in(fn))):
+                    found.setdefault(f"{rel}:{qual}:{name}", Hit(f"{rel}:{qual}:{name}", n.lineno, f"{name} runs "
+                                     "with nothing asking whether this is the live deploy: a test, scratch home or "
+                                     "branch reaches the real effect"))
+            if _is_spawn(n, spawners):
+                prog = _argv0(n.args[0], locals_.get(qual, {}), consts)
+                if prog in binaries and prog not in guarded:
+                    found.setdefault(f"{rel}:{qual}:binary:{prog}", Hit(f"{rel}:{qual}:binary:{prog}", n.lineno,
+                                     f"spawns {prog}, which the test guard does not refuse: a test that takes this "
+                                     "path runs the real program"))
+        for qual, name, line in _effect_defaults(tree, effects):
+            found.setdefault(f"{rel}:{qual}:default:{name}", Hit(f"{rel}:{qual}:default:{name}", line,
+                             f"{name} is bound as a default when the module loads: a stub installed later never "
+                             "reaches this call path"))
+        out.extend(found.values())
+    return out
+
+
+_ENV_SETTERS = {"setenv", "putenv", "setdefault"}
+
+
+def _key_is(node, key):
+    return _str(node) == key or (isinstance(node, ast.Name) and node.id == key) or (
+        isinstance(node, ast.Attribute) and node.attr == key)
+
+
+def _sets_var(fn, key, consts):
+    # The line where `fn` sets environment variable `key`: environ[key] =, setenv/putenv/setdefault(key, ...),
+    # environ.update({key: ...}) or key=..., or a dict naming key (literal, or a module constant) fed through a
+    # variable environ[k] = v.
+    dynamic = False
+    for n in _own(fn):
+        if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and _is_environ(n.value):
+            if _key_is(n.slice, key):
+                return n.lineno
+            dynamic = dynamic or _str(n.slice) is None
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in _ENV_SETTERS and n.args:
+                if _key_is(n.args[0], key):
+                    return n.lineno
+                dynamic = dynamic or _str(n.args[0]) is None
+            elif n.func.attr == "update" and _is_environ(n.func.value):
+                if any(k.arg == key for k in n.keywords) or any(
+                        isinstance(a, ast.Dict) and any(k is not None and _key_is(k, key) for k in a.keys)
+                        for a in n.args):
+                    return n.lineno
+                dynamic = True
+    if dynamic:
+        for n in _own(fn):
+            d = consts.get(n.id) if isinstance(n, ast.Name) else n
+            if isinstance(d, ast.Dict) and any(k is not None and _key_is(k, key) for k in d.keys):
+                return n.lineno
+    return None
+
+
+def _import_reads(tree, reads):
+    # (name, line) for each environment, home or consumer-named read a module performs while it is imported.
+    main = _main_block(tree)
+    stmts = []
+    for s in tree.body:
+        if isinstance(s, ast.ClassDef):
+            stmts.extend(b for b in s.body if not isinstance(b, _DEFS))
+        elif not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)) and s is not main:
+            stmts.append(s)
+    for s in stmts:
+        for n in [s, *_own(s)]:
+            env = _env_name(n)
+            if env:
+                yield env, n.lineno
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "home" and \
+                    isinstance(n.func.value, ast.Name) and n.func.value.id == "Path":
+                yield "home()", n.lineno
+            elif isinstance(n, ast.Call) and _named(n.func, reads):
+                yield _named(n.func, reads), n.lineno
+
+
+def unchecked_order(trees, production=default_production, effects=(), reads=(), entries=(), guard=(), needs=(),
+                    pairs=None):
+    """An order the code needs but does not check: an effect (`effects`) bound as a default argument before any stub
+    can replace it; an environment, home or consumer-named read (`reads`) performed at import; an entry point
+    (`entries`, function names or "__main__") whose reach never calls the guard (`guard`, such as env.guard) in a
+    module that names any of `needs`; and a function that sets a home variable without the backend it pairs with
+    (`pairs`, {home: (backend, ...)})."""
+    effects, reads, guard, needs, pairs = tuple(effects), tuple(reads), tuple(guard), set(needs), dict(pairs or {})
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        found = {}
+        for qual, name, line in _effect_defaults(tree, effects):
+            found.setdefault(f"{rel}:{qual}:default:{name}", Hit(f"{rel}:{qual}:default:{name}", line,
+                             f"{name} is bound when the module loads, before any stub or setup runs"))
+        for name, line in _import_reads(tree, reads):
+            found.setdefault(f"{rel}:<module>:import:{name}", Hit(f"{rel}:<module>:import:{name}", line,
+                             f"{name} is read at import: whatever sets it later (an env script, a fixture, a home "
+                             "switch) comes too late"))
+        if entries and guard and (not needs or needs & _names_in(tree)):
+            defs = _module_defs(tree)
+            for qual, node in _entry_points(tree, rel, set(entries)):
+                if not any(isinstance(n, ast.Call) and _named(n.func, guard) for f in _closure(defs, node)
+                           for n in _walk(f)):
+                    found.setdefault(f"{rel}:{qual}:no-guard", Hit(f"{rel}:{qual}:no-guard", node.lineno,
+                                     "this entry point never calls the guard that sets up what it reads: run any "
+                                     "way but the usual launcher, it reads the wrong place"))
+        consts = {name: v for name, v, _ in _assign_targets(tree)}
+        for qual, fn in _scopes(tree):
+            for home, backends in pairs.items():
+                line = _sets_var(fn, home, consts)
+                if line and not (set(backends) & _names_in(fn)):
+                    found.setdefault(f"{rel}:{qual}:{home}:no-backend", Hit(f"{rel}:{qual}:{home}:no-backend", line,
+                                     f"sets {home} and not {', '.join(backends)}: the backend chosen for the old "
+                                     "home follows the run into the new one"))
+        out.extend(found.values())
+    return out
+
+
 DETECTORS = {
+    "one_sided_schema_check": one_sided_schema_check,
+    "effect_reachable": effect_reachable,
+    "unchecked_order": unchecked_order,
     "prose_match": prose_match,
     "empty_on_failure": empty_on_failure,
     "unpaired_column": unpaired_column,

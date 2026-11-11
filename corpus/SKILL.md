@@ -250,6 +250,65 @@ assert the check fails.
 RULE #382); a server that answered /v1/models with an empty body counted as up
 (RULE #285); #68, #101, #173, #196, #283, #322, #365.
 
+## A deploy runs two releases at once
+
+**Bitten:** 7.
+
+**Trigger:** does this change deploy logic, a migration, the schema version,
+a job's working directory, or anything a node or gateway reports? Which
+release's code runs each step, and against which release's data?
+
+**Tier:** 1 for one-sided schema comparisons and checks that run in both
+phases of a deploy; 2 for orchestration, where the old release's driver runs
+the new release's steps.
+
+**Test shape:** run release N-1's code against N's data and steps, and N
+against N-1's: migrate, then open the store from N-1; queue under N-1, deploy
+N, run the job; smoke N against N-1's services; verify a node on N-1 from N.
+Detector `one_sided_schema_check`: an ordering comparison against a version
+the consumer names that refuses one direction of skew only; a `!=` against
+one whose branch drops the work and says nothing more than a log line; a
+check entry point the consumer names that reaches no phase marker. Blind to
+orchestration versus step behaviour, to processes alive at deploy time, and
+to comparisons inside SQL.
+
+**Instances:** a repair step ran in the old driver (SoHoT RULE #1478); a new
+probe failed its own pre-switch smoke against the old services (RULE #1415);
+release 13's restore crashed in the old code (RULE #1417); settle had to read
+the old release's records (FINDING #1177); a node deploy took its role from
+the Studio's default and installed the Studio's units on the node (ERROR
+#1233); a node deploy rolled back a healthy node and alerted because the
+Studio's gateway answered from its own twin (the styx false rollback of
+2026-11-10, #1791, fixed by PR #1809); delegations from a branch at another
+schema were dropped (#1789, fixed by PR #1807). Open: SoHoT #1786-#1790.
+
+## An order the code needs but does not check
+
+**Bitten:** 7.
+
+**Trigger:** does B silently depend on A having happened first: env sourced,
+schema migrated, queue paused, backend chosen, a hook stubbed? Does B check
+it, or does A only usually come first?
+
+**Tier:** 1 for the syntactic forms: effect functions bound as default
+arguments, values read at import, entry points without the env guard, a home
+switched without its backend. 2 for orders across processes.
+
+**Test shape:** do B without A and assert B refuses or does A itself: stub a
+hook after import and call the default path; run the entry point with the env
+unset; switch the home with the shared backend selected; open the store from
+old code after the migrate. Detector `unchecked_order`: an effect the consumer
+names bound as a default argument; an environment, home or consumer-named read
+at import; a consumer-named entry point whose reach never calls the guard, in
+a module that names what the guard sets up; a home variable set without its
+paired backend. Blind to orders between processes and between functions.
+
+**Instances:** hooks bound as defaults kept the real GitHub and model calls
+under a suite-wide stub (SoHoT RULE #1332, ERROR #1251, #1127, #1128); a
+scratch eval home kept the Postgres backend (RULE #1441); a fit check over ssh
+ran without HF_ROOT (RULE #1428). Open: SoHoT #1795 (fixed by PR #1800),
+#1796.
+
 ## A fact recorded without its context
 
 **Bitten:** 6.
@@ -282,7 +341,8 @@ refusal; run the suite with HOME pointed at an empty dir and assert nothing
 outside it changed.
 
 **Instances:** a worktree migrated the live store (#455, RULE #414); #29, #188,
-#290.
+#290. An alert, push, restart or download reached from the same runs is "An
+effect reachable from a run that is not the live deploy".
 
 ## State is whichever row came last
 
@@ -397,6 +457,39 @@ First-token arrival bounded above, under load 14 (#833). A lock wait bounded
 below, eaten by the taker's interpreter startup under 30 workers (#772).
 A sleep(1.0) used to order two batches, overtaken by a fresh store's
 migrate under load, so the second took the lease first (#844).
+
+## An effect reachable from a run that is not the live deploy
+
+**Bitten:** 5.
+
+**Trigger:** can a test, a scratch home or a non-deploy checkout reach this
+alert, webhook, push, restart, signal, ssh or download? What stops it: a gate
+in the effect itself, a stub, or each caller remembering to pass a fake?
+
+**Tier:** 1 for reachability from tests: effects with no live gate, effect
+hooks bound as default arguments, effect binaries missing from the test
+suite's spawn guard. 2 for a branch running on the live home, which is a
+property of where the process runs.
+
+**Test shape:** call each effect's caller under pytest with no hook passed,
+from a scratch home, and from a non-deploy checkout on the live home with the
+store one schema ahead; assert no real binary ran, no webhook was sent and no
+marker landed in the live home. Detector `effect_reachable`: a call to an
+effect the consumer names where neither the caller nor the effect's own
+definition consults the consumer's live-run predicate; an effect bound as a
+default argument; a spawn of an effect binary the consumer's guard list
+lacks. Blind to argv built from parameters or other functions' returns, to
+effects in shell grandchildren, and to a gate that asks "is this the live
+home" when the question is "is this the deploy code".
+
+**Instances:** a schema-ahead branch on the live home took a GPU lease, read
+the version refusal as an outage and sent a real desktop notice and webhook
+"the store is unreachable" (SoHoT ERROR #1250, #1251, #1720); monitor.alert
+bound notify and send as defaults, so no stub reached them (ERROR #1251); a
+morning test read live gh PR state (ERROR #1127, #1128); a test reached a
+real engine-trial channel (ERROR #1052). Open: SoHoT #1793 (fixed by PR
+#1801). This class takes the effects other than writes; a write to the live
+store or published output is "A non-production run writes live state".
 
 ## A number without its configuration
 

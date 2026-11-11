@@ -89,7 +89,17 @@ store choosers only once named: `{"empty_on_failure": {"choosers": ("backend",)}
 is not a copy of it. `unpaired_column` reads the schema from `{"unpaired_column": {"migrations": ("app/migrations/",),
 "schema": ("app/schema.py",)}}` (`schema` defaults to `migrations`); neither path counts as a writer or reader, and a
 column whose rows are selected with `*` is read by a key lookup anywhere. All three match SQL by its uppercase keywords,
-so lowercase SQL is not seen. An exempt loop or child is a
+so lowercase SQL is not seen. `one_sided_schema_check` needs the version names and the check entry points:
+`{"one_sided_schema_check": {"versions": ("SCHEMA_VERSION", "stored_schema"), "phases": ("smoke",), "markers":
+("SMOKE_PHASE",)}}`. `effect_reachable` needs the effects and the live-run predicate, and refuses effect binaries
+(osascript, launchctl, ssh, gh and the like; override with `binaries`) unless the test guard lists them:
+`{"effect_reachable": {"effects": ("alert", "post"), "live": ("DEFAULT_HOME",), "guarded": ("osascript",),
+"spawners": ("spawn_group",)}}`. `one_sided_schema_check` also takes `skips`, helpers that log and return nothing.
+`unchecked_order` takes `{"effects": ..., "reads": ("hf_home",), "entries": ("main", "__main__"), "guard":
+("env.guard",), "needs": ("models_dir",), "pairs": {"APP_HOME": ("APP_STORE",)}}`; without config it still finds
+environment and `home()` reads at import. Both `effect_reachable` and `unchecked_order` report an effect bound as a
+default argument at the same site, so a consumer that binds both classes binds or waives it under each. An exempt
+loop or child is a
 waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
 existing hits go in its backlog.
 
