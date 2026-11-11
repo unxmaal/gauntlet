@@ -6,6 +6,7 @@ import re
 import shlex
 from pathlib import Path
 
+from gauntlet import detectors as _detectors
 from gauntlet import files as _files
 from gauntlet.findings import Finding
 
@@ -558,7 +559,7 @@ def run(repo, index=None, config=None):
     if index is None:
         plan = [(cls, name) for name, (_, cls) in DETECTORS.items()]
     else:
-        plan = [(cid, e["detector"]) for cid, e in index.items() if e.get("detector") in DETECTORS]
+        plan = [(cid, name) for cid, e in index.items() for name in _detectors.names(e) if name in DETECTORS]
         if repo.errors:
             plan.append(("hcl-unparsed", "hcl_unparsed"))
     out = set()

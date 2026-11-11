@@ -159,3 +159,11 @@ def test_a_consumer_detector_runs_beside_the_package_s(consumer):
     got = _results(reg, skill_dir, extra_detectors={"nothing": nothing})
     assert "app/t.py:X" in got["test_gauntlet_no_new_code_trips_a_detector_without_a_bound_test"]
     assert got["test_gauntlet_every_named_detector_exists"] == "ok"
+
+
+def test_a_class_names_two_detectors_and_both_are_checked(consumer):
+    reg, _ = consumer
+    reg.index[CLOSED]["detector"] = ["commit_then_link", "no_such"]
+    assert ratchet.unknown_detectors(reg) == [f"{CLOSED}: detector no_such does not exist"]
+    reg.index[CLOSED]["detector"] = ["commit_then_link", "torn_append"]
+    assert ratchet.unknown_detectors(reg) == []

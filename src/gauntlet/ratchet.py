@@ -30,8 +30,8 @@ def duplicate_ids(reg):
 
 def unknown_detectors(reg, extra=None):
     known = {*frontends.detector_names(reg.frontends), *detectors.DETECTORS, *(extra or {})}
-    out = [f"{cid}: detector {e['detector']} does not exist" for cid, e in reg.index.items()
-           if e.get("detector") and e["detector"] not in known]
+    out = [f"{cid}: detector {name} does not exist" for cid, e in reg.index.items()
+           for name in detectors.names(e) if name not in known]
     return out + [f"detector_config names {name}, which does not exist" for name in sorted(reg.detector_config)
                   if name not in known]
 
@@ -64,7 +64,7 @@ def frontend_hits(reg, extra=None):
         fe = frontends.get(name, reg.production, extra)
         known = fe.detectors()
         for cid, e in reg.index.items():
-            if e.get("detector") in known:
+            if known & set(detectors.names(e)):
                 out.setdefault(cid, {})
         for f in fe.scan(reg.root, fe.discover(reg.root, lister=reg.files), reg.index, config):
             out.setdefault(f.cls, {}).setdefault(f.site, detectors.Hit(f.site, f.line, f.why))
