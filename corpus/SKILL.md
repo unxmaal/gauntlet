@@ -464,6 +464,32 @@ each input actually came from rather than trusting the parameter you passed.
 / 450" produced identical hop compositions, so the conclusion drawn from them
 described an experiment that never ran (RULE #215).
 
+## A copy whose key leaves out an input, or that nothing invalidates
+
+**Bitten:** 4.
+
+**Trigger:** is this value derived from a file, process, row or remote, and
+kept (an `lru_cache`, a cache file, a derived column, a recorded digest)? What
+changes the source without changing the key? Does a long-lived process write
+back something it cached when it started?
+
+**Tier:** 1, plus tier 2 for naming every input of a key.
+
+**Test shape:** fill the cache, then change the source while holding the key
+fixed, one input at a time (file bytes, mtime, a ceiling, the installed
+version), and read again: assert the cached value is refused or refreshed.
+Detector `uncached_key`: an `lru_cache` or `cache` over file reads or
+subprocesses with no mtime or version among its arguments; a JSON file read
+and written back with no lock; a process-lifetime cache whose value reaches a
+persistent write.
+
+**Instances:** hf-sizes.json was keyed without the ceiling and served a wrong
+size (SoHoT #964, ERROR #519); a process cached a failed identity probe for its
+whole life (SoHoT #747, RULE #670); a downloads row said a model was had while
+its snapshot could not be opened (SoHoT #799, RULE #691); the star graph stayed
+stale while every sweep reported success (SoHoT #187, RULE #258). Shown in code,
+not yet bitten: node digests with no mtime in their key (SoHoT #1775).
+
 ## A part's cost reported as the whole's
 
 **Bitten:** 3.
@@ -647,6 +673,52 @@ with no deadline or message (SoHoT ERROR #1200, #1762); a reinstall waited on
 another job's GPU lease with no bound (RULE #1476, job 1622; #1763); a job
 paused by the watchdog stayed paused for good because nothing but one caller
 reads that state (FINDING #1028, job 0236; #1764).
+
+## A shared-store query with no scope, or a scope with its own idea of NULL
+
+**Bitten:** 3.
+
+**Trigger:** does this query read or write a table that several machines,
+homes or tenants share? Does it filter on the scope column? Does it treat an
+unstamped (NULL) row the same way as every other query?
+
+**Tier:** 1.
+
+**Test shape:** seed two scopes plus an unstamped row in one store; assert each
+query sees only its own scope, and that every query gives NULL the one
+documented meaning. Red-proof by dropping the scope predicate. Detector
+`unscoped_query`: an SQL string on a table the consumer declares scoped (or
+whose CREATE TABLE names a scope column) with no scope predicate and no
+`WHERE id =`; and a `scope IS NULL` written anywhere but the one helper the
+consumer names for it.
+
+**Instances:** the work queue read unstamped jobs as every machine's, so one
+job ran on two machines (SoHoT #703, RULE #669); the same predicate pooled
+every machine's durations (SoHoT #1368, RULE #1235); paused runs were read
+with no machine filter (SoHoT #1730). The inventory found the predicate copied
+21 times with three meanings of NULL.
+
+## A stored pid trusted as the same process
+
+**Bitten:** 3.
+
+**Trigger:** is a pid, pgid or port read back from a file or row, or after a
+restart, and checked only for liveness? What else could hold that number now?
+
+**Tier:** 1.
+
+**Test shape:** store a pid, let the process die, and start an unrelated
+process under that pid (or fake one); assert the check says gone and the
+state that depends on it (a lease, a deploy, a yielder) is freed. Detector
+`stored_pid_liveness`: `os.kill(x, 0)`, or an alive() helper (found, or named
+by the consumer), fed a value read from a file or row, with no pgid,
+start-time or command check in the same function.
+
+**Instances:** a job's pid file named a process that did not lead its group
+(SoHoT #1728, ERROR #1256); a zombie counted as alive (SoHoT #1619, RULE
+#1426); the uv launcher's pid was recorded for the server it started (SoHoT
+#1671, ERROR #1192). Shown in code: a GPU lease holder and a deploy switch
+checked by kill(pid, 0) alone (SoHoT #1772, #1773, fixed by PR #1819).
 
 ## A check whose input differs between the desk and CI
 

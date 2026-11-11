@@ -9,7 +9,8 @@ on a whole codebase as an inventory, not on a diff.
 This is a candidate pool, like `general-corpus.md`. A question whose inventory
 turns up a real instance graduates into SKILL.md as a class, with its trigger,
 test shape and, where possible, a detector. "A lifecycle with no declared
-state" graduated this way on 2026-11-11, then CR, OW and WT.
+state" graduated this way on 2026-11-11, then CR, OW and WT, then SC, ID and
+CA.
 
 ## How to run one
 
@@ -67,11 +68,13 @@ line to decide what to do.
 
 **SC. Scope.** Is every query scoped to this machine, home, tenant and lane?
 List every read of a shared table or directory and the scope columns it
-filters on.
+filters on. Graduated: SKILL.md "A shared-store query with no scope, or a
+scope with its own idea of NULL".
 
 **ID. Identity.** What identifies this thing, and can that identifier be
 reused, recycled or blank? List every identifier used as a key: pids, pgids,
-ports, paths, call ids, names.
+ports, paths, call ids, names. Graduated: SKILL.md "A stored pid trusted as
+the same process".
 
 **EF. Empty versus failed.** Does "nothing" look the same as "failed"? List
 every read whose empty, None or zero result is acted on, and what else
@@ -88,7 +91,8 @@ worktree, row). Who owns it, and who cleans it up when the owner dies?
 Graduated: SKILL.md "A child that outlives its owner".
 
 **CA. Caches.** Is this a copy of something? List every derived file, table
-or in-memory value, its source, and what invalidates it.
+or in-memory value, its source, and what invalidates it. Graduated: SKILL.md
+"A copy whose key leaves out an input, or that nothing invalidates".
 
 **WT. Waits.** List every poll, retry, wait and pending state. Does each have
 a deadline, an owner who is told when it expires, and a named end state?
