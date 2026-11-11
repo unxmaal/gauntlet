@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Tests
+        run: uv run --python ${{ matrix.python }} pytest -q
+      - name: Install the built wheel in a fresh venv
+        run: |
+          set -euo pipefail
+          uv build --wheel -o dist
+          uv venv --python ${{ matrix.python }} fresh
+          VIRTUAL_ENV=fresh uv pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/fresh/bin/gauntlet" corpus-dir | grep -q site-packages/gauntlet/corpus
+          test "$("$GITHUB_WORKSPACE/fresh/bin/gauntlet" classes | wc -l)" -ge 40
