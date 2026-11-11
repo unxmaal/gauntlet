@@ -107,8 +107,24 @@ def test_an_unregistered_move_table_is_waived_with_a_todo_so_the_first_run_passe
     init.run(pyrepo)
     text = (pyrepo / init.REGISTRY_REL).read_text()
     assert f"{init.TODO}move table app/state.py:MOVES" in text
-    assert "'app/state.py:MOVES': " in text
+    assert '"app/state.py:MOVES": WAIVED,' in text
     assert _failing(pyrepo) == {}
+
+
+@pytest.mark.parametrize("rp", [">=3.11", ">=3.12"])
+def test_the_generated_files_pass_ruff_format_and_check_with_default_settings(tmp_path, rp):
+    if importlib.util.find_spec("ruff") is None:
+        pytest.skip("ruff is not installed")
+    ruff = [sys.executable, "-m", "ruff"]
+    root = _repo(tmp_path / "fmt", {"pyproject.toml": PYPROJECT.format(rp=rp), "app/t.py": TABLE,
+                                    "app/state.py": MOVES})
+    init.run(root)
+    rels = [init.REGISTRY_REL, init.TEST_REL]
+    for args in (["format", "--isolated", "--check", "--diff"], ["check", "--isolated"]):
+        run = subprocess.run([*ruff, *args, *rels], cwd=root, capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+    long = [line for rel in rels for line in (root / rel).read_text().splitlines() if len(line) >= 120]
+    assert long == []
 
 
 def test_every_todo_is_one_comment_line(pyrepo):
@@ -322,7 +338,7 @@ ACTIONS = ('OFFERED, CONFIRMED, LOCKED = "offered", "confirmed", "locked"\n'
 def test_init_wires_a_repo_whose_move_table_maps_actions_to_from_and_to_states(pyrepo):
     (pyrepo / "app" / "booking.py").write_text(ACTIONS, encoding="utf-8")
     init.run(pyrepo)
-    assert "'app/booking.py:MOVES': " in (pyrepo / init.REGISTRY_REL).read_text()
+    assert '"app/booking.py:MOVES": WAIVED,' in (pyrepo / init.REGISTRY_REL).read_text()
     assert _failing(pyrepo) == {}
 
 

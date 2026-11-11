@@ -22,15 +22,15 @@ TODO = "# TODO(gauntlet): "
 
 # What init cannot know about a repo, one line per detector that finds little or nothing until told.
 CONFIG_TODOS = {
-    "unscoped_query": 'the scope columns and tables of a shared store: {"columns": ("tenant_id",), "tables": ("jobs",)}',
-    "effect_reachable": 'the effects and the live-run predicate: {"effects": ("send",), "live": ("LIVE_HOME",)}',
-    "unchecked_order": 'the effects and import-time reads that need an order: {"effects": (...), "reads": (...)}',
-    "prose_match": 'the fields that hold prose: {"fields": ("note", "reason")}',
-    "empty_on_failure": 'the functions that choose a store: {"choosers": ("backend",)}',
-    "unpaired_column": 'the migrations and schema paths: {"migrations": ("app/migrations/",), "schema": (...)}',
-    "one_sided_schema_check": 'the schema version names and check entry points: {"versions": (...), "phases": (...)}',
-    "stored_pid_liveness": 'helpers that test a stored pid besides os.kill(pid, 0): {"alive": ("running",)}',
-    "commit_then_link": 'helpers that commit besides conn.commit(): {"committers": ("put",)}',
+    "unscoped_query": 'shared-store scope: {"columns": ("tenant_id",), "tables": ("jobs",)}',
+    "effect_reachable": 'effects, live test: {"effects": ("send",), "live": ("LIVE",)}',
+    "unchecked_order": 'effects, import-time reads: {"effects": (), "reads": ()}',
+    "prose_match": 'fields that hold prose: {"fields": ("note", "reason")}',
+    "empty_on_failure": 'functions that choose a store: {"choosers": ("backend",)}',
+    "unpaired_column": 'migrations, schema: {"migrations": ("db/",), "schema": ()}',
+    "one_sided_schema_check": 'versions, check entry points: {"versions": (), "phases": ()}',
+    "stored_pid_liveness": 'pid tests besides os.kill(pid, 0): {"alive": ("running",)}',
+    "commit_then_link": 'committers besides conn.commit(): {"committers": ("put",)}',
 }
 
 
@@ -173,22 +173,44 @@ def _is_git(root):
     return r.returncode == 0
 
 
+def _q(value):
+    # A literal as the formatters write it: double-quoted strings, tuples with their trailing comma.
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        inner = ", ".join(_q(v) for v in value)
+        return f"[{inner}]" if isinstance(value, list) else f"({inner}{',' if len(value) == 1 else ''})"
+    return repr(value)
+
+
+def _dict_lines(name, items):
+    # `name = {...}` one key per line with a magic trailing comma, which ruff format and black keep exploded.
+    if not items:
+        return [f"{name} = {{}}"]
+    out = [f"{name} = {{"]
+    for key, value in items:
+        if isinstance(value, dict):
+            out.append(f"    {_q(key)}: {{")
+            out += [f"        {_q(k)}: {_q(v)}," for k, v in value.items()]
+            out.append("    },")
+        else:
+            out.append(f"    {_q(key)}: {value},")
+    return out + ["}"]
+
+
 def _registry_text(index, frontends_, backlog_pin, move_sites, todos):
-    lines = [f'"""This repo\'s gauntlet registry, written by `gauntlet init` {__version__}; edit it by hand from here."""',
-             "", "from pathlib import Path", "", "from gauntlet.registry import Registry", "",
+    lines = [f'"""Gauntlet registry, written by `gauntlet init` {__version__}; edit it by hand."""', "",
+             "from pathlib import Path", "", "from gauntlet.registry import Registry", "",
              "HERE = Path(__file__).resolve().parent", "ROOT = HERE.parent.parent", ""]
     lines += [TODO + t for t in todos]
-    lines += ["", "INDEX = {"]
-    for cid, entry in index.items():
-        lines.append(f"    {cid!r}: {entry!r},")
-    lines += ["}", "", "# Unbound hits seeded by init; lower it as the backlog is bound, never raise it.",
-              f"BACKLOG_PIN = {backlog_pin}", "", "MOVE_WAIVERS = {"]
-    for site in move_sites:
-        lines.append(f"    {site!r}: \"not yet registered: gauntlet init found it\",")
-    lines += ["}", "", "REGISTRY = Registry(", "    root=ROOT,", "    index=INDEX,",
+    lines += [""] + _dict_lines("INDEX", list(index.items()))
+    lines += ["", "# Unbound hits seeded by init; lower it as the backlog is bound, never raise it.",
+              f"BACKLOG_PIN = {backlog_pin}", "", 'WAIVED = "not yet registered: gauntlet init found it"', ""]
+    lines += _dict_lines("MOVE_WAIVERS", [(site, "WAIVED") for site in move_sites])
+    lines += ["", "REGISTRY = Registry(", "    root=ROOT,", "    index=INDEX,",
               '    snapshot_file=HERE / "skill_classes.json",', '    defects_file=HERE / "defects.json",',
               '    backlog_file=HERE / "backlog.json",', "    backlog_pin=BACKLOG_PIN,",
-              f"    frontends={tuple(frontends_)!r},", "    move_waivers=MOVE_WAIVERS,", ")", ""]
+              f"    frontends={_q(tuple(frontends_))},", "    move_waivers=MOVE_WAIVERS,", ")", ""]
     return "\n".join(lines)
 
 
@@ -198,8 +220,9 @@ def _test_text(gate):
     if gate:
         head += ["import pytest", "", 'pytest.importorskip("gauntlet.ratchet", reason="gauntlet needs Python 3.12")', ""]
     head += ["from gauntlet import ratchet, skill", "",
-             '_spec = importlib.util.spec_from_file_location("gauntlet_registry", '
-             'Path(__file__).resolve().parent / "gauntlet" / "registry.py")',
+             "_spec = importlib.util.spec_from_file_location(",
+             '    "gauntlet_registry", Path(__file__).resolve().parent / "gauntlet" / "registry.py"',
+             ")",
              "_registry = importlib.util.module_from_spec(_spec)", "_spec.loader.exec_module(_registry)", "",
              "globals().update(ratchet.tests(_registry.REGISTRY, skill_dir=skill.corpus_dir()))", ""]
     return "\n".join(head)
@@ -251,11 +274,10 @@ def init_python(root, pin, has_tf, force=False):
     plan[BACKLOG_REL] = json.dumps(backlog, indent=1) + "\n"
     move_sites = ratchet.move_sites(reg)
     used = {n for e in index.values() for n in detectors.names(e)}
-    todos = ["production: which paths are shipped code; the default is everything outside tests/ and test/.",
-             'repo_slug: "owner/repo" of the issue tracker, for `gauntlet snapshot-defects` and `gauntlet audit`; '
-             "until it is set, defects.json stays empty."]
+    todos = ["production: which paths are shipped code; the default is all but tests/ and test/.",
+             'repo_slug: "owner/repo" for snapshot-defects and audit; until set, defects.json stays empty.']
     todos += [f"detector_config {name}: {CONFIG_TODOS[name]}" for name in sorted(CONFIG_TODOS) if name in used]
-    todos += [f"move table {s}: register a gauntlet.moves.MoveTable and drop its MOVE_WAIVERS line." for s in move_sites]
+    todos += [f"move table {s}: register a MoveTable, drop its MOVE_WAIVERS line." for s in move_sites]
     plan[REGISTRY_REL] = _registry_text(index, fes, total, move_sites, todos)
     plan[TEST_REL] = _test_text(gate)
     ratchets = len(ratchet.tests(reg, skill_dir=skill.corpus_dir()))
