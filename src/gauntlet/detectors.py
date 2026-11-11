@@ -914,6 +914,17 @@ def _consts(tree):
     return {name: _str(v) for name, v, _ in _assign_targets(tree) if _str(v) is not None}
 
 
+def _action_move(node):
+    # An action's (from-states, to-state) value: a collection of state names, then one state name.
+    node = _unwrap(node)
+    return (isinstance(node, (ast.Tuple, ast.List)) and len(node.elts) == 2
+            and isinstance(_unwrap(node.elts[0]), (ast.Set, ast.List, ast.Tuple)) and _state_ref(node.elts[1]))
+
+
+def _action_table(value):
+    return isinstance(value, ast.Dict) and bool(value.values) and all(_action_move(v) for v in value.values)
+
+
 def _pairs(value):
     value = _unwrap(value)
     if isinstance(value, (ast.Set, ast.List, ast.Tuple)):
@@ -922,6 +933,8 @@ def _pairs(value):
         keys = [k for k in value.keys if k is not None]
         if keys and all(_state_pair(k) for k in keys):
             return [(k.elts[0], k.elts[1]) for k in keys]
+        if _action_table(value):
+            return [(f, _unwrap(v).elts[1]) for v in value.values for f in _unwrap(_unwrap(v).elts[0]).elts]
         out = []
         for k, v in zip(value.keys, value.values):
             inner = _unwrap(v)
@@ -943,6 +956,8 @@ def _table_states(rel, tree, name, value, consts):
         return consts.get(ident, ident), {ident}
     table, names = {}, {}
     for frm, to in _pairs(value):
+        if not (_state_ref(frm) and (to is None or _state_ref(to))):
+            continue
         (f, fn), (t, tn) = key(frm), key(to)
         names.setdefault(f, set()).update(fn)
         table.setdefault(f, set())

@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import tomllib
+from collections import namedtuple
 from pathlib import Path
 
 from gauntlet import __version__, detectors, findings, files, frontends, ratchet, skill
@@ -72,27 +73,85 @@ def _section(text, header):
     return m.end(), m.end() + nxt.start() if nxt else len(text)
 
 
+_PIN = re.compile(r""""gauntlet\s*(?:\[[^\]]*\])?\s*@[^"]*"|'gauntlet\s*(?:\[[^\]]*\])?\s*@[^']*'""")
+
+
+def _drop_item(text, start, end):
+    # text without the array item at [start, end) and its trailing comma; its whole line when it stood alone.
+    end = re.compile(r"[ \t]*,?[ \t]*").match(text, end).end()
+    line = text.rfind("\n", 0, start) + 1
+    if not text[line:start].strip() and text[end:end + 1] in ("\n", ""):
+        return text[:line] + text[end + 1:]
+    return text[:start] + text[end:]
+
+
 def add_pin(text, requirement):
-    """pyproject text with `requirement` as a dev dependency: replacing any gauntlet pin, else in the dev group."""
-    existing = re.search(r""""gauntlet\s*(?:\[[^\]]*\])?\s*@[^"]*"|'gauntlet\s*(?:\[[^\]]*\])?\s*@[^']*'""", text)
-    if existing:
-        return text[:existing.start()] + f'"{requirement}"' + text[existing.end():]
-    for header in ("dependency-groups", "project.optional-dependencies"):
-        span = _section(text, header)
-        if span is None:
-            continue
-        m = re.search(r"(?m)^dev\s*=\s*\[", text[span[0]:span[1]])
-        if m:
-            return _array_insert(text, span[0] + m.end() - 1, requirement)
-        if header == "dependency-groups":
-            return text[:span[0]] + f'\ndev = ["{requirement}"]' + text[span[0]:]
-    return text.rstrip("\n") + f'\n\n[dependency-groups]\ndev = ["{requirement}"]\n'
+    """pyproject text with `requirement` as the only gauntlet pin, in [dependency-groups] dev (made if absent).
+    Never an optional-dependency extra: that is package metadata, where hatchling refuses a git reference."""
+    for m in reversed(list(_PIN.finditer(text))):
+        text = _drop_item(text, m.start(), m.end())
+    span = _section(text, "dependency-groups")
+    if span is None:
+        return text.rstrip("\n") + f'\n\n[dependency-groups]\ndev = ["{requirement}"]\n'
+    m = re.search(r"(?m)^dev\s*=\s*\[", text[span[0]:span[1]])
+    if m:
+        return _array_insert(text, span[0] + m.end() - 1, requirement)
+    return text[:span[0]] + f'\ndev = ["{requirement}"]' + text[span[0]:]
 
 
-def _dev_requirements(data):
-    groups = data.get("dependency-groups", {}).get("dev", [])
-    extras = data.get("project", {}).get("optional-dependencies", {}).get("dev", [])
-    return [r for r in groups + extras if isinstance(r, str)]
+def pin_problem(text, requirement):
+    """Why `text` does not hold `requirement` once, in the dev group and in no extra; None when it does."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return f"the edited pyproject.toml is not valid TOML ({e})"
+    group = [r for r in data.get("dependency-groups", {}).get("dev", []) if isinstance(r, str)]
+    if group.count(requirement) != 1:
+        return "the pin is not in [dependency-groups] dev exactly once"
+    extras = data.get("project", {}).get("optional-dependencies", {})
+    if any(isinstance(r, str) and _PIN.fullmatch(f'"{r}"') for reqs in extras.values() for r in reqs):
+        return "a gauntlet pin is left in [project.optional-dependencies]"
+    return None
+
+
+_CI_KEY = re.compile(r"(?i)python-version|--python\b|\buv python install\b|^\s*-?\s*python\w*\s*:")
+_CI_VERSION = re.compile(r"(?<![\d.])3\.(\d+)(?![\d])")
+
+
+def _below(line):
+    return {f"3.{m}" for m in _CI_VERSION.findall(line) if int(m) < 12}
+
+
+def ci_pythons_below_312(root):
+    """{workflow path: versions below 3.12} named by python-version, --python and python matrix lines in CI."""
+    out = {}
+    wf = Path(root) / ".github" / "workflows"
+    for path in sorted([*wf.glob("*.yml"), *wf.glob("*.yaml")]) if wf.is_dir() else []:
+        found, listing = set(), False
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if _CI_KEY.search(line):
+                found |= _below(line)
+                listing = line.rstrip().endswith(":")
+            elif listing and line.lstrip().startswith("-"):
+                found |= _below(line)
+            else:
+                listing = False
+        if found:
+            out[path.relative_to(root).as_posix()] = sorted(found, key=_version)
+    return out
+
+
+def python_warnings(root, spec):
+    """One warning per place this repo runs Python older than 3.12, where gauntlet is not installed."""
+    out = []
+    if admits_below_312(spec):
+        where = f"requires-python {spec!r} admits Python below 3.12" if spec else "no requires-python"
+        out.append(f"{where}: there the marker leaves gauntlet uninstalled and {TEST_REL} skips; "
+                   "run the ratchets on Python 3.12 or newer")
+    for rel, versions in ci_pythons_below_312(root).items():
+        out.append(f"{rel} runs Python {', '.join(versions)}: there {TEST_REL} skips, so that CI never enforces "
+                   "the ratchets; add a job on 3.12 or newer")
+    return out
 
 
 def detector_index(snapshot, hcl=False):
@@ -137,7 +196,7 @@ def _test_text(gate):
     head = ['"""The gauntlet ratchets over this repo\'s registry; written by `gauntlet init`."""', "",
             "import importlib.util", "from pathlib import Path", ""]
     if gate:
-        head += ["import pytest", "", 'pytest.importorskip("gauntlet", reason="gauntlet needs Python 3.12")', ""]
+        head += ["import pytest", "", 'pytest.importorskip("gauntlet.ratchet", reason="gauntlet needs Python 3.12")', ""]
     head += ["from gauntlet import ratchet, skill", "",
              '_spec = importlib.util.spec_from_file_location("gauntlet_registry", '
              'Path(__file__).resolve().parent / "gauntlet" / "registry.py")',
@@ -152,11 +211,16 @@ def _need_hcl():
         raise SystemExit("this repo has .tf files: install the hcl extra, gauntlet[hcl], and run init again")
 
 
-def _write(root, rel, text, written):
-    path = Path(root) / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    written.append(rel)
+Result = namedtuple("Result", "written todos backlog notes warnings ratchets")
+
+
+def _write_all(root, plan):
+    # Every file at once, after everything was computed: a failure before this point leaves the repo untouched.
+    for rel, text in plan.items():
+        path = Path(root) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return list(plan)
 
 
 def init_python(root, pin, has_tf, force=False):
@@ -165,18 +229,18 @@ def init_python(root, pin, has_tf, force=False):
         raise SystemExit(f"{REGISTRY_REL} exists: init refuses to overwrite it (pass --force to rewrite it)")
     if has_tf:
         _need_hcl()
-    written, notes = [], []
-    pyproject = root / "pyproject.toml"
-    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    gate = admits_below_312(data.get("project", {}).get("requires-python"))
+    plan, notes = {}, []
+    before = (root / "pyproject.toml").read_text(encoding="utf-8")
+    spec = tomllib.loads(before).get("project", {}).get("requires-python")
+    gate = admits_below_312(spec)
     req = pin_requirement(pin, ("hcl",) if has_tf else (), gate)
-    text = add_pin(pyproject.read_text(encoding="utf-8"), req)
-    if req not in _dev_requirements(tomllib.loads(text)):
-        raise SystemExit(f"could not place {req!r} in pyproject.toml; add it to the dev dependencies by hand")
-    _write(root, "pyproject.toml", text, written)
+    plan["pyproject.toml"] = add_pin(before, req)
+    why = pin_problem(plan["pyproject.toml"], req)
+    if why:
+        raise SystemExit(f"could not place {req!r} in pyproject.toml: {why}; add it to [dependency-groups] dev by hand")
     snapshot = skill.read_skill(skill.corpus_dir())
-    _write(root, SNAPSHOT_REL, json.dumps(snapshot, indent=1) + "\n", written)
-    _write(root, DEFECTS_REL, "[]\n", written)
+    plan[SNAPSHOT_REL] = json.dumps(snapshot, indent=1) + "\n"
+    plan[DEFECTS_REL] = "[]\n"
     fes = ("python", "hcl") if has_tf else ("python",)
     index = detector_index(snapshot, hcl=has_tf)
     reg = Registry(root=root, index=index, snapshot_file=root / SNAPSHOT_REL, defects_file=root / DEFECTS_REL,
@@ -184,19 +248,22 @@ def init_python(root, pin, has_tf, force=False):
     led, _ = ratchet.tree_ledger(reg)
     backlog = {cid: row["unbound"] for cid, row in sorted(led.items()) if row["unbound"]}
     total = sum(len(v) for v in backlog.values())
-    _write(root, BACKLOG_REL, json.dumps(backlog, indent=1) + "\n", written)
+    plan[BACKLOG_REL] = json.dumps(backlog, indent=1) + "\n"
     move_sites = ratchet.move_sites(reg)
     used = {n for e in index.values() for n in detectors.names(e)}
     todos = ["production: which paths are shipped code; the default is everything outside tests/ and test/.",
-             'repo_slug: "owner/repo" of the issue tracker, for `gauntlet snapshot-defects` and `gauntlet audit`.']
+             'repo_slug: "owner/repo" of the issue tracker, for `gauntlet snapshot-defects` and `gauntlet audit`; '
+             "until it is set, defects.json stays empty."]
     todos += [f"detector_config {name}: {CONFIG_TODOS[name]}" for name in sorted(CONFIG_TODOS) if name in used]
     todos += [f"move table {s}: register a gauntlet.moves.MoveTable and drop its MOVE_WAIVERS line." for s in move_sites]
-    _write(root, REGISTRY_REL, _registry_text(index, fes, total, move_sites, todos), written)
-    _write(root, TEST_REL, _test_text(gate), written)
+    plan[REGISTRY_REL] = _registry_text(index, fes, total, move_sites, todos)
+    plan[TEST_REL] = _test_text(gate)
+    ratchets = len(ratchet.tests(reg, skill_dir=skill.corpus_dir()))
     if pin != f"v{__version__}":
         notes.append(f"the snapshot is this installed version's corpus (v{__version__}), not {pin}'s: "
                      f"install {pin} and run init --force")
-    return written, len(todos), total, notes
+    warnings = python_warnings(root, spec)
+    return Result(_write_all(root, plan), len(todos), total, notes, warnings, ratchets)
 
 
 def _check_text(pin):
@@ -216,13 +283,11 @@ def init_terraform(root, pin, force=False):
     _need_hcl()
     fe = frontends.get("hcl")
     found = sorted(set(fe.scan(root, fe.discover(root))))
-    written = []
-    _write(root, BASELINE_REL, findings.render(found, "json"), written)
-    _write(root, CHECK_REL, _check_text(pin), written)
+    written = _write_all(root, {BASELINE_REL: findings.render(found, "json"), CHECK_REL: _check_text(pin)})
     (root / CHECK_REL).chmod(0o755)
     notes = ["Terraform only: no pyproject.toml, so no registry and no pytest ratchets. This is the minimal form: "
              f"run {CHECK_REL} in CI; it fails on a finding not in the baseline."]
-    return written, 0, len(found), notes
+    return Result(written, 0, len(found), notes, [], 0)
 
 
 def run(root=".", pin=None, force=False):
