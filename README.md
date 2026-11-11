@@ -83,7 +83,13 @@ A detector that needs repo knowledge takes it from `Registry(detector_config={na
 until it is told the scope: `{"unscoped_query": {"columns": ("machine_id",), "tables": ("jobs",), "helpers": ("_here",),
 "null_helper": "app/scope.py:here"}}`; a table whose CREATE TABLE names a scope column is scoped without being listed,
 and uppercase SQL keywords are what mark a string as a query. `stored_pid_liveness` finds a helper that only does
-`os.kill(pid, 0)`; name others with `{"stored_pid_liveness": {"alive": ("running",)}}`. An exempt loop or child is a
+`os.kill(pid, 0)`; name others with `{"stored_pid_liveness": {"alive": ("running",)}}`. `prose_match` needs the
+fields that hold prose: `{"prose_match": {"fields": ("note", "detail", "reason")}}`. `empty_on_failure` finds
+store choosers only once named: `{"empty_on_failure": {"choosers": ("backend",)}}`, and a module that defines a chooser
+is not a copy of it. `unpaired_column` reads the schema from `{"unpaired_column": {"migrations": ("app/migrations/",),
+"schema": ("app/schema.py",)}}` (`schema` defaults to `migrations`); neither path counts as a writer or reader, and a
+column whose rows are selected with `*` is read by a key lookup anywhere. All three match SQL by its uppercase keywords,
+so lowercase SQL is not seen. An exempt loop or child is a
 waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
 existing hits go in its backlog.
 

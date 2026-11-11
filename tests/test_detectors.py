@@ -626,3 +626,146 @@ def test_a_stamped_cache_a_locked_json_cache_and_an_unpersisted_cache_are_left_a
                          "def save(d):\n    with open(\"c.json.tmp\", \"w\") as f:\n        json.dump(d, f)\n"
                          "    os.replace(\"c.json.tmp\", \"c.json\")\n")}
     assert sites(detectors.uncached_key, {**innocent, **torn}) == ["app/o.py:save"]
+
+
+_PROSE = ("note", "detail", "reason", "why", "outcome", "evidence")
+
+
+def prose_sites(files, fields=_PROSE):
+    return sorted({h.site for h in detectors.prose_match(detectors.parse(files), fields=fields)})
+
+
+def test_a_decision_matched_out_of_stored_prose_is_found():
+    bad = {"app/gate.py": (
+        "import re\nPASSED = re.compile(r\"passed over\")\nAT_STOP_TIME = \"stop time\"\n"
+        "def verdict(conn):\n"
+        "    return conn.execute(\"SELECT id FROM verdicts WHERE v.detail LIKE 'repo:%' AND x = 1\").fetchone()\n"
+        "def overrun(conn, out):\n    return conn.execute(\"SELECT 1 FROM acts WHERE instr(evidence, ?) > 0\", (out,))\n"
+        "def superseded(job):\n    return job[\"note\"].startswith(\"superseded by \")\n"
+        "def held(row):\n    return \"notified:\" in (row.outcome or \"\")\n"
+        "def looks(progress):\n    return str(progress.get(\"why\") or \"\").startswith(AT_STOP_TIME)\n"
+        "def aged(rows):\n    return [r for r in rows if PASSED.search(r[\"detail\"])]\n"
+        "def refused(reason):\n    return re.match(r\"too-big\", reason.strip())\n")}
+    assert prose_sites(bad) == ["app/gate.py:aged:detail", "app/gate.py:held:outcome", "app/gate.py:looks:why",
+                                "app/gate.py:overrun:evidence", "app/gate.py:refused:reason",
+                                "app/gate.py:superseded:note", "app/gate.py:verdict:detail"]
+    assert prose_sites(bad, fields=()) == []
+
+
+def test_prose_compared_whole_external_text_and_its_blind_spots_are_left_alone():
+    innocent = {"app/gate.py": (
+        "def by_column(conn):\n    return conn.execute(\"SELECT id FROM verdicts WHERE reason = ? AND lane = 'repo'\")\n"
+        "def external(proc):\n    return proc.stderr.startswith(\"error\")\n"
+        "def named(row):\n    return row[\"name\"].startswith(\"Qwen\")\n"
+        "def show(detail):\n    print(detail)\n"
+        "def whole(job):\n    return job[\"note\"] == \"superseded\"\n"
+        "def variable(job, prefix):\n    return job[\"note\"].startswith(prefix)\n"
+        "def lower(conn):\n    return conn.execute(\"select id from verdicts where detail like 'repo:%'\")\n"
+        "def label(conn):\n    return conn.execute(\"SELECT 1 FROM t WHERE title LIKE 'x%'\")\n"
+        "def message():\n    return \"refused: the detail GLOB matched nothing\"\n")}
+    bad = {"app/r.py": "def f(conn):\n    return conn.execute(\"SELECT 1 FROM t WHERE note GLOB 'x*'\")\n"}
+    assert prose_sites(innocent) == []
+    assert prose_sites({**innocent, **bad}) == ["app/r.py:f:note"]
+
+
+_LEDGER = ("import json, sqlite3\nfrom app import store, deploy\n"
+           "def gateway_rows(conn):\n    try:\n        return conn.execute(\"SELECT * FROM g\").fetchall()\n"
+           "    except sqlite3.OperationalError:\n        return []\n"
+           "def passed_over(conn):\n    try:\n        got = {r[0]: r[1] for r in conn.execute(\"SELECT n, d FROM v\")}\n"
+           "    except sqlite3.Error:\n        got = {}\n    return got\n"
+           "def settle():\n    try:\n        return deploy.settle()\n    except (OSError, ValueError):\n        return\n"
+           "def maybe(conn, strict):\n    try:\n        return conn.execute(\"SELECT 1\").fetchall()\n"
+           "    except sqlite3.Error:\n        if strict:\n            raise\n        return []\n"
+           "def show(conn):\n    rows = gateway_rows(conn)\n    if not rows:\n"
+           "        print(\"no gateway requests in the window\")\n"
+           "def report(path):\n    try:\n        rows = json.loads(path.read_text())\n    except OSError:\n"
+           "        rows = None\n    if rows is None:\n        print(f\"nothing recorded in {path}\")\n"
+           "def gather():\n    return store.connect() if store.backend() == \"postgres\" else None\n")
+_CHOOSER = ("from app import store\n"
+            "def _read_conn():\n    if store.backend() == \"postgres\":\n        return store.connect()\n"
+            "    return None\n")
+_STORE = "def backend():\n    return \"sqlite\"\ndef connect():\n    return None\ndef ok():\n    return backend()\n"
+
+
+def empty_sites(files, **config):
+    return sorted({h.site for h in detectors.empty_on_failure(detectors.parse(files), **config)})
+
+
+def test_a_failed_read_returned_as_nothing_a_none_message_over_it_and_copied_store_choosers_are_found():
+    bad = {"app/ledger.py": _LEDGER, "app/context.py": _CHOOSER, "app/store.py": _STORE}
+    found = ["app/ledger.py:gateway_rows:except", "app/ledger.py:maybe:except", "app/ledger.py:passed_over:except",
+             "app/ledger.py:report:none-message", "app/ledger.py:settle:except", "app/ledger.py:show:none-message"]
+    assert empty_sites(bad) == found
+    assert empty_sites(bad, choosers=("backend",)) == sorted(
+        found + ["app/context.py:_read_conn:chooser", "app/ledger.py:gather:chooser"])
+
+
+def test_a_read_that_raises_or_says_it_failed_and_a_single_store_chooser_are_left_alone():
+    innocent = {"app/ledger.py": (
+        "import json, sqlite3\nDEFAULTS = {\"a\": 1}\n"
+        "class StoreDown(Exception):\n    pass\n"
+        "def strict(conn):\n    try:\n        return conn.execute(\"SELECT * FROM g\").fetchall()\n"
+        "    except sqlite3.Error as exc:\n        raise StoreDown(\"the store could not be read\") from exc\n"
+        "def logged(conn):\n    try:\n        rows = conn.execute(\"SELECT * FROM g\").fetchall()\n"
+        "    except sqlite3.Error:\n        rows = []\n        raise\n    return rows\n"
+        "def show(conn):\n    rows = strict(conn)\n    if not rows:\n        print(\"no gateway requests\")\n"
+        "def number(text):\n    try:\n        return int(text)\n    except ValueError:\n        return 0\n"
+        "def config(path):\n    try:\n        return json.loads(path.read_text())\n    except OSError:\n"
+        "        return DEFAULTS\n"
+        "def report(path):\n    try:\n        rows = json.loads(path.read_text())\n    except OSError:\n"
+        "        rows = None\n    if rows is None:\n        print(\"could not read the ledger: no file\")\n"),
+        "app/common.py": _CHOOSER, "app/store.py": _STORE}
+    bad = {"app/x.py": "def f(p):\n    try:\n        return open(p).read()\n    except OSError:\n        return ''\n"}
+    quiet_then_fires(detectors.empty_on_failure, innocent, bad)
+    assert empty_sites(innocent, choosers=("backend",)) == []
+
+
+_DDL = ("SCHEMA = \"\"\"\nCREATE TABLE IF NOT EXISTS jobs (\n    id INTEGER PRIMARY KEY,\n"
+        "    argv TEXT NOT NULL DEFAULT '',  -- the command, as run\n    note TEXT,\n"
+        "    night_gate INTEGER DEFAULT 0,\n    machine_id INTEGER REFERENCES machines(id),\n"
+        "    UNIQUE (argv, note)\n);\n"
+        "CREATE TABLE day_clearances (id INTEGER PRIMARY KEY, cleared_at REAL, until REAL);\n\"\"\"\n")
+_MIGRATION = ("def up(c):\n    c.execute(\"ALTER TABLE jobs ADD COLUMN shown_first TEXT\")\n"
+              "    c.execute(\"UPDATE jobs SET night_gate = 1\")\n"
+              "    c.execute(\"SELECT note, night_gate, cleared_at FROM jobs, day_clearances\")\n")
+_WR = {"migrations": ("app/schema.py", "app/migrations/")}
+
+
+def column_sites(files, **config):
+    return sorted({h.site for h in detectors.unpaired_column(detectors.parse(files), **{**_WR, **config})})
+
+
+def test_a_column_nothing_writes_or_nothing_reads_is_found():
+    bad = {"app/schema.py": _DDL, "app/migrations/v2.py": _MIGRATION, "app/q.py": (
+        "def add(conn, argv, m):\n"
+        "    conn.execute(\"INSERT INTO jobs (argv, machine_id, shown_first) VALUES (?, ?, '')\", (argv, m))\n"
+        "def mine(conn, m):\n    return conn.execute(\"SELECT id, argv FROM jobs WHERE machine_id = ?\", (m,))\n"
+        "def annotate(conn, i, n):\n    conn.execute(\"UPDATE jobs SET note = ? WHERE id = ?\", (n, i))\n"
+        "def clearances(conn):\n    return conn.execute(\"SELECT cleared_at, until FROM day_clearances\")\n")}
+    assert column_sites(bad) == [
+        "app/migrations/v2.py:jobs.shown_first:no-reader", "app/schema.py:day_clearances.cleared_at:no-writer",
+        "app/schema.py:day_clearances.until:no-writer", "app/schema.py:jobs.night_gate:no-reader",
+        "app/schema.py:jobs.night_gate:no-writer", "app/schema.py:jobs.note:no-reader"]
+    assert column_sites(bad, migrations=("app/migrations/",), schema=("app/schema.py",)) == [
+        s for s in column_sites(bad) if "shown_first" not in s]
+    assert column_sites(bad, migrations=()) == []
+
+
+def test_columns_paired_through_upserts_dynamic_inserts_and_selected_rows_are_left_alone():
+    innocent = {"app/schema.py": _DDL, "app/migrations/v2.py": _MIGRATION, "app/q.py": (
+        "def add(conn, argv, m):\n"
+        "    conn.execute(\"INSERT INTO jobs (argv, machine_id, shown_first) VALUES (?, ?, '') \"\n"
+        "                 \"ON CONFLICT (argv) DO UPDATE SET night_gate = excluded.night_gate\", (argv, m))\n"
+        "def put(conn, **cols):\n"
+        "    conn.execute(\"INSERT INTO day_clearances (\" + \", \".join(cols) + \") VALUES (?, ?)\", tuple(cols))\n"
+        "def clear(conn):\n    put(conn, cleared_at=1.0, until=2.0)\n"
+        "def rows(conn):\n    return [dict(r) for r in conn.execute(\"SELECT * FROM jobs WHERE machine_id = ?\", (1,))]\n"
+        "def gated(conn):\n    return conn.execute(\"SELECT cleared_at, until FROM day_clearances\").fetchall()\n"
+        "def annotate(conn, i, n):\n    conn.execute(\"UPDATE jobs SET note = ? WHERE id = ?\", (n, i))\n"),
+        "app/show.py": ("from app.q import rows\n"
+                        "def show(conn):\n    for r in rows(conn):\n"
+                        "        print(r[\"argv\"], r[\"note\"], r.get(\"night_gate\"), r[\"shown_first\"])\n")}
+    assert column_sites(innocent) == []
+    bad = {"app/migrations/v3.py": "SQL = \"ALTER TABLE jobs ADD COLUMN said TEXT\"\n"}
+    assert column_sites({**innocent, **bad}) == ["app/migrations/v3.py:jobs.said:no-reader",
+                                                 "app/migrations/v3.py:jobs.said:no-writer"]
