@@ -86,7 +86,8 @@ def _scanner_exists(repo, ref):
 def _instance_problems(cid, entry, defects):
     out = []
     instances = entry["instances"]
-    if not instances:
+    # A class held by a detector may be bound before it bites here; `gauntlet init` binds that way.
+    if not instances and not entry.get("detector"):
         out.append(f"{cid}: no instance; a class is bound here only once it has bitten")
     for inst in instances:
         if not (isinstance(inst, dict) and len(inst) == 1 and set(inst) <= {"issue", "rule"}

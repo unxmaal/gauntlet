@@ -2109,6 +2109,35 @@ DETECTORS = {
     "loopback_equality": loopback_equality,
 }
 
+# The corpus class each detector holds; `gauntlet init` builds a consumer's index from it. move_tables feeds a ratchet.
+CLASSES = {
+    "one_sided_schema_check": "a-deploy-runs-two-releases-at-once",
+    "effect_reachable": "an-effect-reachable-from-a-run-that-is-not-the-live-deploy",
+    "unchecked_order": "an-order-the-code-needs-but-does-not-check",
+    "prose_match": "a-decision-read-back-out-of-a-sentence-the-code-wrote",
+    "empty_on_failure": "nothing-and-failed-return-the-same-value",
+    "unpaired_column": "a-stored-value-with-no-live-writer-or-no-reader",
+    "unscoped_query": "a-shared-store-query-with-no-scope-or-a-scope-with-its-own-idea-of-null",
+    "stored_pid_liveness": "a-stored-pid-trusted-as-the-same-process",
+    "uncached_key": "a-copy-whose-key-leaves-out-an-input-or-that-nothing-invalidates",
+    "commit_then_link": "two-durable-writes-with-no-repair-for-the-gap",
+    "torn_append": "two-durable-writes-with-no-repair-for-the-gap",
+    "orphanable_child": "a-child-that-outlives-its-owner",
+    "undeadlined_wait": "a-wait-with-no-deadline-owner-or-end-state",
+    "terminal_without_reader": "a-wait-with-no-deadline-owner-or-end-state",
+    "row_index_keys": "order-assumed-on-unordered-data",
+    "closed_tables": "a-closed-table-fronting-an-open-set",
+    "latest_row_state": "state-is-whichever-row-came-last",
+    "unguarded_transition": "a-lifecycle-with-no-declared-state",
+    "unreached_guards": "a-guard-built-and-tested-that-nothing-invokes",
+    "ignored_options": "an-input-accepted-and-silently-ignored",
+    "member_defaults": "one-default-tuned-for-one-member-applied-to-all",
+    "harness_verdicts": "a-fact-about-the-harness-recorded-as-a-verdict-on-the-subject",
+    "duplicated_literals": "one-question-two-answers",
+    "env_seams": "each-half-verified-against-its-own-spec-the-seam-against-nothing",
+    "loopback_equality": "identity-by-name-not-by-content",
+}
+
 
 def names(entry):
     """The detector names an index entry gives: one name or a list of them."""
