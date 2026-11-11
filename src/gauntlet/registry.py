@@ -37,6 +37,7 @@ class Registry:
     files: Callable[[Path], list] | None = None
     moves: tuple = ()
     move_waivers: dict = field(default_factory=dict)
+    detector_config: dict = field(default_factory=dict)
 
     def snapshot(self):
         return skill.load_snapshot(self.snapshot_file)

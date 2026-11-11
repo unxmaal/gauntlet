@@ -499,7 +499,550 @@ def move_tables(trees, production=default_production):
     return out
 
 
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _own(node):
+    # Every node under `node` that is not inside a nested function or class.
+    out, todo = [], list(ast.iter_child_nodes(node))
+    while todo:
+        n = todo.pop()
+        if isinstance(n, _DEFS):
+            continue
+        out.append(n)
+        todo.extend(ast.iter_child_nodes(n))
+    return sorted(out, key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)))
+
+
+def _call_name(call):
+    f = call.func
+    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+
+
+def _bodies(tree):
+    # (qualname, node) for the module and each function, so a scan of own nodes covers every statement once.
+    yield "<module>", tree
+    yield from _scopes(tree)
+
+
+def _kw(call, name):
+    return next((k.value for k in call.keywords if k.arg == name), None)
+
+
+def _false(node):
+    return isinstance(node, ast.Constant) and node.value in (False, None, 0)
+
+
+_LINK_SQL = re.compile(r"(?is)^\s*(?:INSERT|UPDATE|REPLACE)\b")
+_DEDUP_SQL = re.compile(r"(?is)\bON\s+CONFLICT\b|\bINSERT\s+OR\s+(?:IGNORE|REPLACE)\b|^\s*REPLACE\b")
+_DEDUP_KW = {"dedup", "dedupe", "dedup_key", "idempotency_key", "unique_key"}
+
+
+def _committers(prod, extra):
+    names = set(extra)
+    for tree in prod.values():
+        for name, fn in _scopes(tree):
+            if any(isinstance(n, ast.Call) and _call_name(n) == "commit" and not n.args for n in _own(fn)):
+                names.add(name.rsplit(".", 1)[-1])
+    return names
+
+
+def commit_then_link(trees, production=default_production, committers=()):
+    """A helper that commits, whose returned id is then written by a second write: a death between leaves one."""
+    prod = _prod(trees, production)
+    known = _committers(prod, committers)
+    out = []
+    for rel, tree in prod.items():
+        for name, fn in _bodies(tree):
+            short = name.rsplit(".", 1)[-1]
+            nodes = _own(fn)
+            local = set(known) - {short}
+            for n in nodes:
+                if isinstance(n, ast.Assign) and not isinstance(n.value, ast.Call) and any(
+                        isinstance(r, (ast.Name, ast.Attribute)) and (getattr(r, "id", None) or r.attr) in local
+                        for r in _walk(n.value)):
+                    local |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+
+            def commits(call):
+                if not (isinstance(call, ast.Call) and _call_name(call) in local):
+                    return False
+                deferred = _kw(call, "commit")
+                return not (deferred is not None and _false(deferred)) and not any(
+                    k.arg in _DEDUP_KW for k in call.keywords)
+            tainted, first = set(), None
+            for n in nodes:
+                value = n.value if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else None
+                if value is not None and any(commits(m) for m in _walk(value)):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name)}
+                    first = first or n.lineno
+                elif (isinstance(n, ast.Call) and _call_name(n) in ("append", "add", "extend")
+                      and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
+                      and any(commits(m) for a in n.args for m in _walk(a))):
+                    tainted.add(n.func.value.id)
+                    first = first or n.lineno
+            if not tainted:
+                continue
+            for n in nodes:
+                if not isinstance(n, ast.Call) or n.lineno < first:
+                    continue
+                rest = [a for a in n.args[1:]] + [k.value for k in n.keywords]
+                sql = _sql_text(n.args[0]) if n.args else None
+                link = (_call_name(n) in ("execute", "executemany") and sql and _LINK_SQL.search(sql)
+                        and not _DEDUP_SQL.search(sql) and any(tainted & _names(a) for a in rest))
+                link = link or (commits(n) and any(tainted & _names(a) for a in n.args + [k.value for k in n.keywords]))
+                if link:
+                    out.append(Hit(f"{rel}:{name}", n.lineno, "a committed id written by a second, separate write; "
+                                   "a death between the two leaves the first with nothing pointing at it"))
+                    break
+    return out
+
+
+_STOPS_ON = {"ValueError", "JSONDecodeError"}
+
+
+def _stop_reader(fn):
+    for loop in (n for n in _own(fn) if isinstance(n, (ast.For, ast.While))):
+        for t in (n for n in _own(loop) if isinstance(n, ast.Try)):
+            if not any(isinstance(m, ast.Call) and _call_name(m) == "loads" for b in t.body for m in _walk(b)):
+                continue
+            for h in t.handlers:
+                caught = {x.id if isinstance(x, ast.Name) else x.attr for x in _walk(h.type or ast.Name("BaseException"))
+                          if isinstance(x, (ast.Name, ast.Attribute))}
+                if caught & _STOPS_ON and any(isinstance(s, (ast.Break, ast.Return)) for b in h.body for s in _walk(b)):
+                    return True
+    return False
+
+
+def _mode(call):
+    m = _kw(call, "mode")
+    if m is None:
+        pos = 1 if isinstance(call.func, ast.Name) else 0
+        m = call.args[pos] if len(call.args) > pos else None
+    return _str(m) or ""
+
+
+def _appends(fn):
+    return any(isinstance(n, ast.Call) and _call_name(n) == "open" and "a" in _mode(n) and "+" not in _mode(n)
+               for n in _own(fn))
+
+
+def _repairs(fn):
+    for n in _own(fn):
+        if not isinstance(n, ast.Call):
+            continue
+        if _call_name(n) in ("seek", "truncate"):
+            return True
+        if _call_name(n) == "endswith" and n.args and isinstance(n.args[0], ast.Constant) \
+                and n.args[0].value in ("\n", b"\n"):
+            return True
+    return False
+
+
+def torn_append(trees, production=default_production):
+    """An appender to a line-per-record file whose reader stops at the first bad line: a torn line hides the rest."""
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        scopes = list(_scopes(tree))
+        if not any(_stop_reader(fn) for _, fn in scopes):
+            continue
+        for name, fn in scopes:
+            if _appends(fn) and not _repairs(fn):
+                out.append(Hit(f"{rel}:{name}", fn.lineno, "appends after a possibly torn last line, and the "
+                               "reader in this module stops at the first line it cannot parse"))
+    return out
+
+
+def _new_session(call):
+    if _call_name(call) != "Popen":
+        return False
+    sess, pre, group = _kw(call, "start_new_session"), _kw(call, "preexec_fn"), _kw(call, "process_group")
+    if sess is not None and not _false(sess):
+        return True
+    if pre is not None and "setsid" in ast.unparse(pre):
+        return True
+    if group is not None and not (isinstance(group, ast.Constant) and group.value is None):
+        return True
+    argv = call.args[0] if call.args else _kw(call, "args")
+    return isinstance(argv, (ast.List, ast.Tuple)) and bool(argv.elts) and _str(argv.elts[0]) == "setsid"
+
+
+_STOP_NAME = re.compile(r"(?i)stop|kill|term|reap|shutdown|close")
+
+
+def _installs_term(node):
+    nodes = _walk(node)
+    return (any(isinstance(n, ast.Call) and _call_name(n) == "signal" for n in nodes)
+            and any((isinstance(n, ast.Name) and n.id == "SIGTERM") or (isinstance(n, ast.Attribute)
+                    and n.attr == "SIGTERM") for n in nodes))
+
+
+def _dotted(rel):
+    mod = rel[:-3] if rel.endswith(".py") else rel
+    parts = mod.split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    names = {".".join(parts)}
+    for i in range(1, len(parts)):
+        names.add(".".join(parts[i:]))
+    return names
+
+
+def _imports(rel, tree, by_name):
+    pkg = rel.split("/")[:-1]
+    out = set()
+    for n in _walk(tree):
+        mods = []
+        if isinstance(n, ast.Import):
+            mods = [a.name for a in n.names]
+        elif isinstance(n, ast.ImportFrom):
+            base = n.module or ""
+            if n.level:
+                up = pkg[:len(pkg) - (n.level - 1)] if n.level > 1 else pkg
+                base = ".".join(up + ([base] if base else []))
+            mods = [base] + [f"{base}.{a.name}" if base else a.name for a in n.names]
+        for m in mods:
+            while m:
+                if m in by_name:
+                    out |= by_name[m]
+                    break
+                m = m.rpartition(".")[0]
+    return out
+
+
+def _entry(rel, tree):
+    return rel.endswith("__main__.py") or any(
+        isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "__name__"
+        and any(_str(c) == "__main__" for c in n.comparators) for n in _walk(tree))
+
+
+def _late(fn_name, node, finals):
+    return fn_name.rsplit(".", 1)[-1] in ("__exit__", "__aexit__", "__del__") or id(node) in finals
+
+
+def _finals(fn):
+    return {id(m) for t in _own(fn) if isinstance(t, ast.Try) for s in t.finalbody for m in _walk(s)}
+
+
+def _atexit_names(tree):
+    return {ast.unparse(n.args[0]).rsplit(".", 1)[-1] for n in _walk(tree)
+            if isinstance(n, ast.Call) and _call_name(n) == "register" and n.args
+            and isinstance(n.func, ast.Attribute) and ast.unparse(n.func.value) == "atexit"}
+
+
+def _stops(fn, handle):
+    for n in _own(fn):
+        if not isinstance(n, ast.Call):
+            continue
+        name = _call_name(n) or ""
+        recv = n.func.value if isinstance(n.func, ast.Attribute) else None
+        on_handle = recv is not None and handle(recv) and name in ("terminate", "kill", "send_signal")
+        passes = _STOP_NAME.search(name) and any(handle(x) for a in n.args for x in _walk(a))
+        if on_handle or passes:
+            yield n
+
+
+def _orphan_popens(rel, tree, protected_fn):
+    atexits = _atexit_names(tree)
+    owner = _innermost(tree)
+    scopes = dict(_scopes(tree))
+    parent = {id(c): p for p in _walk(tree) for c in ast.iter_child_nodes(p)}
+    for call in (n for n in _walk(tree) if isinstance(n, ast.Call) and _new_session(n)):
+        name = owner.get(id(call), "<module>")
+        fn = scopes.get(name, tree)
+        up = parent.get(id(call))
+        var = attr = None
+        if isinstance(up, ast.Assign) and len(up.targets) == 1:
+            t = up.targets[0]
+            var = t.id if isinstance(t, ast.Name) else None
+            attr = t.attr if isinstance(t, ast.Attribute) else None
+        elif isinstance(up, ast.withitem) and isinstance(up.optional_vars, ast.Name):
+            var = up.optional_vars.id
+        if var is None and attr is None:
+            continue
+        if attr is not None:
+            def handle(x, a=attr):
+                return isinstance(x, ast.Attribute) and x.attr == a
+            homes = list(scopes.items())
+        else:
+            def handle(x, v=var):
+                return isinstance(x, ast.Name) and x.id == v
+            homes = [(name, fn)]
+        stops = [(h, s) for h, f in homes for s in _stops(f, handle)]
+        if not stops or protected_fn(call, fn, parent):
+            continue
+        if all(_late(h, s, _finals(scopes.get(h, tree))) or h.rsplit(".", 1)[-1] in atexits for h, s in stops):
+            yield Hit(f"{rel}:{name}", call.lineno, "a child in its own session stopped only on the way out "
+                      "(finally, __exit__, atexit); a SIGTERM or SIGKILL to the owner skips that and leaves the child")
+
+
+_MARK_WRITE = ("write_text", "write_bytes", "touch")
+_OWNED = re.compile(r"(?i)pid|expir|deadline|ttl|until|lease")
+
+
+def _mark_key(recv):
+    if isinstance(recv, ast.Name):
+        return recv.id
+    if isinstance(recv, ast.Attribute):
+        return recv.attr
+    if isinstance(recv, ast.BinOp) and isinstance(recv.op, ast.Div):
+        return _str(recv.right)
+    return None
+
+
+def _marker_files(prod):
+    writes, lifts, moved = {}, {}, set()
+    for rel, tree in sorted(prod.items()):
+        for name, fn in _bodies(tree):
+            for n in _own(fn):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+                    continue
+                key = _mark_key(n.func.value)
+                if not key:
+                    continue
+                if n.func.attr in _MARK_WRITE:
+                    owned = any(_OWNED.search(x.id if isinstance(x, ast.Name) else x.attr if isinstance(
+                        x, ast.Attribute) else _str(x) or "") for x in _walk(fn))
+                    writes.setdefault(key, []).append((rel, name, n.lineno, owned))
+                elif n.func.attr == "unlink":
+                    lifts.setdefault(key, set()).add((rel, name))
+                elif n.func.attr in ("replace", "rename"):
+                    moved.add(key)
+    for key, rows in writes.items():
+        lifted = lifts.get(key, set())
+        homes = {rel for rel, *_ in rows}
+        if key in moved or not {r for r, _ in lifted} & homes or any(owned for *_, owned in rows) or len(lifted) > 1:
+            continue
+        rel, _, line, _ = rows[0]
+        lifter = ":".join(next(iter(lifted)))
+        yield Hit(f"{rel}:{key}", line, f"a marker file with no pid or expiry, lifted only by {lifter}; "
+                  "if that path does not run, the marker stays")
+
+
+def orphanable_child(trees, production=default_production):
+    """A new-session child whose only stop runs on the way out, reached from an entry point with no SIGTERM handler;
+    and a marker file with no owner pid or expiry that one path alone lifts."""
+    prod = _prod(trees, production)
+    by_name = {}
+    for rel in prod:
+        for d in _dotted(rel):
+            by_name.setdefault(d, set()).add(rel)
+    edges = {rel: _imports(rel, tree, by_name) for rel, tree in prod.items()}
+    term_fns = {name.rsplit(".", 1)[-1] for tree in prod.values() for name, fn in _scopes(tree) if _installs_term(fn)}
+
+    def reach(start):
+        seen, todo = set(), [start]
+        while todo:
+            r = todo.pop()
+            if r not in seen:
+                seen.add(r)
+                todo.extend(edges.get(r, ()))
+        return seen
+    entries = {rel: (reach(rel), _installs_term(tree)) for rel, tree in prod.items() if _entry(rel, tree)}
+
+    out = []
+    for rel, tree in prod.items():
+        def protected(call, fn, parent, rel=rel):
+            if _installs_term(fn):
+                return True
+            node = call
+            while id(node) in parent:
+                node = parent[id(node)]
+                if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+                        isinstance(i.context_expr, ast.Call) and _call_name(i.context_expr) in term_fns
+                        for i in node.items):
+                    return True
+            reaching = [term for closure, term in entries.values() if rel in closure]
+            return bool(reaching) and all(reaching)
+        out.extend(_orphan_popens(rel, tree, protected))
+    out.extend(_marker_files(prod))
+    return out
+
+
+_CLOCKS = {"time", "monotonic", "perf_counter", "monotonic_ns", "time_ns", "perf_counter_ns", "now", "utcnow"}
+_DEADLINE_PARAM = re.compile(r"(?i)deadline|until|stop_at|expires?|timeout")
+
+
+def _clocked(node, clock_vars):
+    return any((isinstance(n, ast.Call) and _call_name(n) in _CLOCKS) or (isinstance(n, ast.Name)
+               and n.id in clock_vars) for n in _walk(node))
+
+
+def _waits(loop):
+    for n in _own(loop):
+        if not isinstance(n, ast.Call):
+            continue
+        name = _call_name(n)
+        if name in ("sleep", "wait"):
+            return True
+        if name == "get" and isinstance(n.func, ast.Attribute) and re.search(r"(?i)queue|^q$|_q$",
+                                                                             ast.unparse(n.func.value)):
+            return True
+    return False
+
+
+def undeadlined_wait(trees, production=default_production):
+    """A while loop that sleeps or waits with no clock comparison and no capped counter: it can wait forever."""
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        for name, fn in _bodies(tree):
+            nodes = _own(fn)
+            args = fn.args if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+            params = {a.arg for a in (args.posonlyargs + args.args + args.kwonlyargs if args else [])
+                      if _DEADLINE_PARAM.search(a.arg)}
+            for loop in (n for n in nodes if isinstance(n, ast.While)):
+                if not _waits(loop):
+                    continue
+                clock_vars = set(params)
+                for n in nodes:
+                    if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.lineno < loop.lineno and n.value is not None \
+                            and _clocked(n.value, clock_vars):
+                        targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                        clock_vars |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name)}
+                body = _own(loop)
+                counters = {n.target.id for n in body if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name)}
+                compares = [c for c in [*_walk(loop.test), *body] if isinstance(c, ast.Compare)]
+                if any(_clocked(c, clock_vars) or counters & _names(c) for c in compares):
+                    continue
+                out.append(Hit(f"{rel}:{name}", loop.lineno, "a loop that waits with no deadline and no cap; "
+                               "nothing ends it but the condition it waits on"))
+                break
+    return out
+
+
+def _consts(tree):
+    return {name: _str(v) for name, v, _ in _assign_targets(tree) if _str(v) is not None}
+
+
+def _pairs(value):
+    value = _unwrap(value)
+    if isinstance(value, (ast.Set, ast.List, ast.Tuple)):
+        return [(e.elts[0], e.elts[1]) for e in value.elts if _state_pair(e)]
+    if isinstance(value, ast.Dict):
+        keys = [k for k in value.keys if k is not None]
+        if keys and all(_state_pair(k) for k in keys):
+            return [(k.elts[0], k.elts[1]) for k in keys]
+        out = []
+        for k, v in zip(value.keys, value.values):
+            inner = _unwrap(v)
+            out += [(k, e) for e in getattr(inner, "elts", [])]
+            if not getattr(inner, "elts", None):
+                out.append((k, None))
+        return out
+    return []
+
+
+def _table_states(rel, tree, name, value, consts):
+    # {state: frozenset(next)} and {state: names that stand for it} from a move table's literal.
+    def key(node):
+        if node is None:
+            return None, set()
+        if isinstance(node, ast.Constant):
+            return node.value, set()
+        ident = node.id if isinstance(node, ast.Name) else node.attr
+        return consts.get(ident, ident), {ident}
+    table, names = {}, {}
+    for frm, to in _pairs(value):
+        (f, fn), (t, tn) = key(frm), key(to)
+        names.setdefault(f, set()).update(fn)
+        table.setdefault(f, set())
+        if to is not None:
+            names.setdefault(t, set()).update(tn)
+            table[f].add(t)
+            table.setdefault(t, set())
+    return table, names
+
+
+def _registered_tables(tables, prod):
+    from gauntlet import moves
+    for t in tables:
+        rel, _, name = t.site.partition(":")
+        tree = prod.get(rel)
+        consts = _consts(tree) if tree is not None else {}
+        table = moves.normalize(t.moves)
+        names = {s: {c for c, v in consts.items() if v == s} for s in table}
+        line = next((ln for n, _, ln in _assign_targets(tree) if n == name), 1) if tree is not None else 1
+        yield rel, name, line, table, names
+
+
+def _found_tables(prod):
+    for rel, tree in prod.items():
+        consts = _consts(tree)
+        for name, value, line in _assign_targets(tree):
+            if _MOVE_NAME.fullmatch(name) and _move_shaped(value):
+                table, names = _table_states(rel, tree, name, value, consts)
+                yield rel, name, line, table, names
+
+
+def _refs(node, state, names):
+    return [n for n in _walk(node) if (isinstance(n, ast.Constant) and n.value == state and isinstance(state, str))
+            or (isinstance(n, ast.Name) and n.id in names) or (isinstance(n, ast.Attribute) and n.attr in names)]
+
+
+_WHERE = re.compile(r"(?is)\bWHERE\b(.*)$")
+
+
+def _uses(tree, state, names, skip):
+    # (reads, writes): a read compares against the state or filters on it in SQL; any other mention is a write.
+    reads = writes = 0
+    counted = {id(v) for n in _walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
+    for n in _walk(tree):
+        if id(n) in skip or id(n) in counted:
+            continue
+        if isinstance(n, ast.Compare) or isinstance(n, ast.match_case):
+            got = _refs(n if isinstance(n, ast.Compare) else n.pattern, state, names)
+            if got:
+                reads += 1
+                counted |= {id(g) for g in got}
+            continue
+        text = _sql_text(n)
+        if text and isinstance(state, str) and f"'{state}'" in text:
+            where = _WHERE.search(text)
+            if where and f"'{state}'" in where.group(1):
+                reads += 1
+            else:
+                writes += 1
+            counted.add(id(n))
+            continue
+        if isinstance(n, (ast.Constant, ast.Name, ast.Attribute)) and _refs(n, state, names) and id(n) not in counted:
+            if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)):
+                writes += 1
+            counted.add(id(n))
+    return reads, writes
+
+
+def terminal_without_reader(trees, production=default_production, tables=None):
+    """A state no move leaves whose only mentions are in the modules that write it: nothing settles, expires or
+    reports a row that reaches it. `tables` are registered MoveTables; without them the declared tables are read."""
+    prod = _prod(trees, production)
+    found = list(_registered_tables(tables, prod)) if tables else list(_found_tables(prod))
+    out = []
+    for rel, name, line, table, names in found:
+        home = prod.get(rel)
+        decl = set()
+        if home is not None:
+            decl = {id(m) for n, v, _ in _assign_targets(home) if n == name or n in set().union(*names.values())
+                    for m in _walk(v)}
+        for state in sorted((s for s, nxt in table.items() if not nxt and s is not None), key=str):
+            readers, writers = set(), {rel}
+            for other, tree in prod.items():
+                r, w = _uses(tree, state, names.get(state, set()), decl if other == rel else set())
+                if w:
+                    writers.add(other)
+                if r:
+                    readers.add(other)
+            if not readers - writers:
+                out.append(Hit(f"{rel}:{name}:{state}", line, "no move leaves this state and nothing outside the "
+                               "modules that write it reads it: a row that lands here is never settled or reported"))
+    return out
+
+
 DETECTORS = {
+    "commit_then_link": commit_then_link,
+    "torn_append": torn_append,
+    "orphanable_child": orphanable_child,
+    "undeadlined_wait": undeadlined_wait,
+    "terminal_without_reader": terminal_without_reader,
     "move_tables": move_tables,
     "row_index_keys": row_index_keys,
     "closed_tables": closed_tables,
@@ -515,14 +1058,16 @@ DETECTORS = {
 }
 
 
-def run(trees, index, production=default_production, detectors=None):
+def run(trees, index, production=default_production, detectors=None, config=None):
+    """`config` maps a detector name to the keyword arguments a consumer supplies it (committers, tables)."""
     table = {**DETECTORS, **(detectors or {})}
+    config = config or {}
     out = {}
     for cid, entry in index.items():
         name = entry.get("detector")
         if name in table:
             hits = {}
-            for h in table[name](trees, production):
+            for h in table[name](trees, production, **config.get(name, {})):
                 hits.setdefault(h.site, h)
             out[cid] = sorted(hits.values())
     return out

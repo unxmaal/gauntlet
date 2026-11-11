@@ -327,3 +327,184 @@ def test_a_consumer_may_add_its_own_detector():
 def test_a_class_naming_a_detector_that_does_not_exist_is_left_to_the_ratchet_not_a_crash():
     trees = detectors.parse({"app/a.py": "x = 1\n"})
     assert detectors.run(trees, {"c": {"detector": "no_such"}, "d": {"detector": "env_seams"}}) == {"d": []}
+
+
+_ADD = ("def add(conn, argv):\n    cur = conn.execute(\"INSERT INTO jobs (argv) VALUES (?)\", (argv,))\n"
+        "    conn.commit()\n    return cur.lastrowid\n")
+
+
+def test_a_committed_id_linked_by_a_second_write_is_found():
+    bad = {"app/q.py": _ADD, "app/r.py": (
+        "from app import q\n"
+        "def resume(conn, row, add=None):\n    add = add or q.add\n    jid = add(conn, row.argv)\n"
+        "    conn.execute(\"UPDATE runs SET job_id = ? WHERE id = ?\", (jid, row.id))\n    conn.commit()\n"
+        "def sweep(conn, values):\n    ids = []\n    for v in values:\n        ids.append(q.add(conn, v))\n"
+        "    conn.execute(\"INSERT INTO sweeps (jobs) VALUES (?)\", (str(ids),))\n")}
+    assert sites(detectors.commit_then_link, bad) == ["app/r.py:resume", "app/r.py:sweep"]
+
+
+def test_a_link_in_the_same_transaction_or_keyed_for_dedup_is_left_alone():
+    innocent = {"app/q.py": _ADD, "app/r.py": (
+        "from app import q\n"
+        "def one(conn, row):\n    jid = q.add(conn, row.argv, commit=False)\n"
+        "    conn.execute(\"UPDATE runs SET job_id = ? WHERE id = ?\", (jid, row.id))\n    conn.commit()\n"
+        "def keyed(conn, row):\n    jid = q.add(conn, row.argv)\n"
+        "    conn.execute(\"INSERT INTO runs (job_id) VALUES (?) ON CONFLICT DO NOTHING\", (jid,))\n"
+        "def unlinked(conn, row):\n    jid = q.add(conn, row.argv)\n    print(jid)\n")}
+    bad = {"app/s.py": ("from app import q\ndef late(conn, row):\n    jid = q.add(conn, row.argv)\n"
+                        "    conn.execute(\"UPDATE runs SET job_id = ?\", (jid,))\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+
+
+def test_a_consumer_names_a_committer_the_scan_cannot_see():
+    files = {"app/r.py": "from lib import store\ndef f(conn):\n    k = store.put(1)\n"
+                         "    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n"}
+    assert sites(detectors.commit_then_link, files) == []
+    got = detectors.commit_then_link(detectors.parse(files), committers=("put",))
+    assert [h.site for h in got] == ["app/r.py:f"]
+
+
+_READ_STOPS = ("import json\n"
+               "def read(path):\n    rows = []\n    for line in open(path):\n        try:\n"
+               "            rows.append(json.loads(line))\n        except ValueError:\n            break\n"
+               "    return rows\n")
+
+
+def test_an_append_after_a_reader_that_stops_on_a_torn_line_is_found():
+    bad = {"app/c.py": _READ_STOPS + ("def add(path, row):\n    with open(path, \"a\") as f:\n"
+                                      "        f.write(json.dumps(row) + \"\\n\")\n")}
+    assert sites(detectors.torn_append, bad) == ["app/c.py:add"]
+
+
+def test_an_append_that_repairs_the_tail_or_a_reader_that_skips_is_left_alone():
+    skip = _READ_STOPS.replace("break", "continue")
+    innocent = {
+        "app/c.py": _READ_STOPS + ("def add(path, row):\n    with open(path, \"rb\") as f:\n        f.seek(-1, 2)\n"
+                                   "        torn = f.read(1) != b\"\\n\"\n"
+                                   "    with open(path, \"a\") as f:\n"
+                                   "        f.write((\"\\n\" if torn else \"\") + json.dumps(row))\n"
+                                   "def rw(path, row):\n    with open(path, \"a+\") as f:\n        f.write(row)\n"
+                                   "def fix(path, row):\n    text = open(path).read()\n"
+                                   "    if text and not text.endswith(\"\\n\"):\n        text += \"\\n\"\n"
+                                   "    with open(path, \"a\") as f:\n        f.write(json.dumps(row))\n"),
+        "app/d.py": skip + "def add(path, row):\n    with open(path, mode=\"a\") as f:\n        f.write(row)\n"}
+    bad = {"app/e.py": _READ_STOPS + "def add(p, row):\n    with p.open(\"a\") as f:\n        f.write(row)\n"}
+    quiet_then_fires(detectors.torn_append, innocent, bad)
+
+
+_SERVED = ("import subprocess, contextlib, os, signal\n"
+           "@contextlib.contextmanager\ndef served(argv):\n"
+           "    proc = subprocess.Popen(argv, start_new_session=True)\n"
+           "    try:\n        yield proc\n    finally:\n        os.killpg(proc.pid, signal.SIGTERM)\n")
+
+
+def test_a_new_session_child_stopped_only_on_the_way_out_is_found():
+    bad = {"app/serve.py": _SERVED,
+           "app/run.py": "from app import serve\ndef main():\n    with serve.served([\"x\"]):\n        pass\n"
+                         "if __name__ == \"__main__\":\n    main()\n",
+           "app/needle.py": ("import subprocess, atexit, os\nclass S:\n    def __init__(self):\n"
+                             "        self.proc = subprocess.Popen([\"s\"], preexec_fn=os.setsid)\n"
+                             "        atexit.register(self.close)\n"
+                             "    def close(self):\n        self.proc.terminate()\n")}
+    assert sites(detectors.orphanable_child, bad) == ["app/needle.py:S.__init__", "app/serve.py:served"]
+
+
+def test_a_child_whose_owner_handles_sigterm_or_stops_it_in_line_is_left_alone():
+    handled = ("import signal\nfrom app import serve\n"
+               "def main():\n    signal.signal(signal.SIGTERM, lambda *a: None)\n"
+               "    with serve.served([\"x\"]):\n        pass\n"
+               "if __name__ == \"__main__\":\n    main()\n")
+    innocent = {
+        "app/serve.py": _SERVED, "app/run.py": handled,
+        "app/m.py": ("import subprocess, signal, contextlib\n"
+                     "@contextlib.contextmanager\ndef term_raises():\n"
+                     "    old = signal.signal(signal.SIGTERM, lambda *a: None)\n    yield\n"
+                     "def group(argv):\n    with term_raises():\n"
+                     "        p = subprocess.Popen(argv, start_new_session=True)\n"
+                     "        try:\n            p.wait()\n        finally:\n            p.kill()\n"
+                     "def inline(argv):\n    p = subprocess.Popen(argv, start_new_session=True)\n"
+                     "    p.wait(5)\n    p.terminate()\n"
+                     "def same_group(argv):\n    p = subprocess.Popen(argv)\n    try:\n        p.wait()\n"
+                     "    finally:\n        p.kill()\n"
+                     "def detached(argv):\n    subprocess.Popen(argv, start_new_session=True)\n")}
+    bad = {"app/cli.py": "from app import serve\nif __name__ == \"__main__\":\n    serve.served([\"y\"])\n"}
+    quiet_then_fires(detectors.orphanable_child, innocent, bad)
+
+
+def test_a_marker_file_with_no_owner_lifted_on_one_path_is_found():
+    bad = {"app/q.py": ("import time\nclass Q:\n"
+                        "    def hold(self):\n        (self.root / \"held\").write_text(str(time.time()))\n"
+                        "    def release(self):\n        (self.root / \"held\").unlink()\n")}
+    assert sites(detectors.orphanable_child, bad) == ["app/q.py:held"]
+
+
+def test_a_marker_with_a_pid_or_several_lifters_or_an_atomic_rename_is_left_alone():
+    innocent = {"app/q.py": (
+        "import os\nclass Q:\n"
+        "    def hold(self):\n        self.lock.write_text(str(os.getpid()))\n"
+        "    def release(self):\n        self.lock.unlink()\n"
+        "    def pause(self):\n        self.paused.touch()\n"
+        "    def resume(self):\n        self.paused.unlink()\n"
+        "    def settle(self):\n        self.paused.unlink(missing_ok=True)\n"
+        "    def save(self, text):\n        self.tmp.write_text(text)\n        self.tmp.replace(self.dest)\n"
+        "    def drop(self):\n        self.tmp.unlink()\n")}
+    bad = {"app/r.py": "def mark(d):\n    (d / \"busy\").touch()\ndef clear(d):\n    (d / \"busy\").unlink()\n"}
+    quiet_then_fires(detectors.orphanable_child, innocent, bad)
+
+
+def test_a_wait_with_no_deadline_or_cap_is_found():
+    bad = {"app/w.py": ("import time\n"
+                        "def quiesce(is_running):\n    while is_running():\n        time.sleep(5)\n"
+                        "def retry(attempt):\n    tries = 0\n    while True:\n        tries += 1\n"
+                        "        row = attempt()\n        if row:\n            return row\n        time.sleep(1)\n"
+                        "def drain(queue):\n    while True:\n        item = queue.get()\n        if item is None:\n"
+                        "            break\n")}
+    assert sites(detectors.undeadlined_wait, bad) == ["app/w.py:drain", "app/w.py:quiesce", "app/w.py:retry"]
+
+
+def test_a_wait_with_a_deadline_or_a_capped_counter_is_left_alone():
+    innocent = {"app/w.py": (
+        "import time\n"
+        "def until(pred, timeout):\n    end = time.monotonic() + timeout\n    while pred():\n"
+        "        if time.monotonic() > end:\n            raise TimeoutError\n        time.sleep(1)\n"
+        "def capped(pred):\n    n = 0\n    while pred():\n        n += 1\n        if n > 10:\n            break\n"
+        "        time.sleep(1)\n"
+        "def param(pred, deadline):\n    while pred() and clock() < deadline:\n        time.sleep(1)\n"
+        "def spin(xs):\n    while xs:\n        xs.pop()\n"
+        "def bounded(pred):\n    for _ in range(10):\n        time.sleep(1)\n")}
+    bad = {"app/v.py": "import time\ndef f(p):\n    while not p.done:\n        p.event.wait(1)\n"}
+    quiet_then_fires(detectors.undeadlined_wait, innocent, bad)
+
+
+_STATES = ("PENDING = \"pending\"\nRUNNING = \"running\"\nPAUSED = \"paused\"\nDONE = \"done\"\n"
+           "MOVES = {PENDING: {RUNNING}, RUNNING: {PAUSED, DONE}, PAUSED: set(), DONE: set()}\n")
+_WRITER = ("from app import js\n"
+           "def pause(conn, i):\n    conn.execute(\"UPDATE jobs SET state = 'paused' WHERE id = ?\", (i,))\n"
+           "def finish(conn, i):\n    conn.execute(\"UPDATE jobs SET state = ? WHERE id = ?\", (js.DONE, i))\n")
+_REPORT = "from app import js\ndef done(rows):\n    return [r for r in rows if r.state == js.DONE]\n"
+
+
+def test_a_terminal_state_no_one_outside_its_writers_reads_is_found():
+    files = {"app/js.py": _STATES, "app/wq.py": _WRITER, "app/report.py": _REPORT}
+    assert sites(detectors.terminal_without_reader, files) == ["app/js.py:MOVES:paused"]
+
+
+def test_a_terminal_state_read_elsewhere_is_left_alone_and_registered_tables_are_used():
+    innocent = {"app/js.py": _STATES, "app/wq.py": _WRITER, "app/report.py": _REPORT,
+                "app/sweep.py": ("def unstick(conn):\n"
+                                 "    conn.execute(\"UPDATE jobs SET state = 'pending' WHERE state = 'paused'\")\n")}
+    quiet_then_fires(detectors.terminal_without_reader, innocent, {"app/report.py": "def done(rows):\n    return rows\n"})
+    from gauntlet.moves import MoveTable
+    table = MoveTable("app/js.py:MOVES", {"pending": {"running"}, "running": {"paused", "stuck"}}, initial=["pending"])
+    got = detectors.terminal_without_reader(detectors.parse(innocent), tables=[table])
+    assert [h.site for h in got] == ["app/js.py:MOVES:stuck"]
+
+
+def test_run_hands_a_detector_its_configuration():
+    files = {"app/r.py": "from lib import store\ndef f(conn):\n    k = store.put(1)\n"
+                         "    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n"}
+    index = {"c": {"detector": "commit_then_link"}}
+    trees = detectors.parse(files)
+    assert detectors.run(trees, index) == {"c": []}
+    got = detectors.run(trees, index, config={"commit_then_link": {"committers": ("put",)}})
+    assert [h.site for h in got["c"]] == ["app/r.py:f"]

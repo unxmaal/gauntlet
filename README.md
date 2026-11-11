@@ -76,6 +76,13 @@ It also fails on any module constant named `MOVES`, `TRANSITIONS` or `*_MOVES` h
 `MoveTable` and no reason in `Registry(move_waivers={site: why})`. Without a Registry, `moves.assert_sound(tables)`
 is the same check as a plain assertion.
 
+A detector that needs repo knowledge takes it from `Registry(detector_config={name: kwargs})`.
+`commit_then_link` finds committing helpers by their `conn.commit()`; name others with
+`{"commit_then_link": {"committers": ("put",)}}`. `terminal_without_reader` gets `Registry.moves` unless
+`detector_config` gives it `tables`, and otherwise reads the declared `MOVES` literals. An exempt loop or child is a
+waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
+existing hits go in its backlog.
+
 The CLI takes the same object:
 
     gauntlet audit --registry tests.gauntlet.registry:REGISTRY [--offline]

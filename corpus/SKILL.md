@@ -373,6 +373,31 @@ both sides carry one, so existing records stay valid.
 that changes the exam, and compared case *ids*. Rewriting a case in place kept
 its id, its count and its receipt.
 
+## A test that bounds a measured duration
+
+**Bitten:** 5.
+
+**Trigger:** does a test compare an elapsed time (perf_counter, time.time,
+a measured wait or TTFT) against a number? Is any of that time spent in
+something the test does not control: interpreter startup, a sleeping fake,
+the scheduler under parallel workers?
+
+**Tier:** 2. A scanner for `perf_counter() - ` beside `<` or `>=` in tests
+would find the sites but cannot tell a meaningless-generous bound from a tight one.
+
+**Test shape:** assert what the duration stood for. Order (acquired after
+released, reasoning before answer), counts (peak in-flight requests), lower
+bounds that a slow machine cannot break, or a structural fact (the holder is
+still alive). Keep a time bound only if it is loose enough to mean "did not
+hang".
+
+**Instances:** a held-lock refusal timed under 1.0 s, 2.85 s on Windows CI
+(RULE #533). Best-of concurrency timed under 0.9 s, 0.9004 on macOS CI (#819).
+First-token arrival bounded above, under load 14 (#833). A lock wait bounded
+below, eaten by the taker's interpreter startup under 30 workers (#772).
+A sleep(1.0) used to order two batches, overtaken by a fresh store's
+migrate under load, so the second took the lease first (#844).
+
 ## A number without its configuration
 
 **Bitten:** 4.
@@ -438,31 +463,6 @@ each input actually came from rather than trusting the parameter you passed.
 **Instance:** three crowd configurations labelled "1 hop", "2 hops" and "2 hops
 / 450" produced identical hop compositions, so the conclusion drawn from them
 described an experiment that never ran (RULE #215).
-
-## A test that bounds a measured duration
-
-**Bitten:** 5.
-
-**Trigger:** does a test compare an elapsed time (perf_counter, time.time,
-a measured wait or TTFT) against a number? Is any of that time spent in
-something the test does not control: interpreter startup, a sleeping fake,
-the scheduler under parallel workers?
-
-**Tier:** 2. A scanner for `perf_counter() - ` beside `<` or `>=` in tests
-would find the sites but cannot tell a meaningless-generous bound from a tight one.
-
-**Test shape:** assert what the duration stood for. Order (acquired after
-released, reasoning before answer), counts (peak in-flight requests), lower
-bounds that a slow machine cannot break, or a structural fact (the holder is
-still alive). Keep a time bound only if it is loose enough to mean "did not
-hang".
-
-**Instances:** a held-lock refusal timed under 1.0 s, 2.85 s on Windows CI
-(RULE #533). Best-of concurrency timed under 0.9 s, 0.9004 on macOS CI (#819).
-First-token arrival bounded above, under load 14 (#833). A lock wait bounded
-below, eaten by the taker's interpreter startup under 30 workers (#772).
-A sleep(1.0) used to order two batches, overtaken by a fresh store's
-migrate under load, so the second took the lease first (#844).
 
 ## A part's cost reported as the whole's
 
@@ -599,6 +599,55 @@ job ran on two machines and a restarting worker failed another machine's job
 from verdict rows until one column with one writer replaced the inference
 (#393, #399, fixed by #409, RULE #389). Inventory and detector: #1727.
 
+## A child that outlives its owner
+
+**Bitten:** 3.
+
+**Trigger:** does this start a process in its own session (`start_new_session`,
+`setsid`, a shell `&`), or write a marker file (a pause flag, a hold, a lock),
+whose only cleanup is in `finally`, `atexit`, `__exit__` or an EXIT trap? A
+SIGTERM with the default handler skips all of those and SIGKILL skips
+everything, so who stops the child or lifts the flag when the owner dies?
+
+**Tier:** 1.
+
+**Test shape:** start the owner for real, send it SIGTERM and then SIGKILL, and
+assert no child process and no flag is left behind. Detector
+`orphanable_child`: a new-session Popen stopped only on the way out, reached
+from an entry point that installs no SIGTERM handler; and a marker file with no
+owner pid or expiry that one path alone lifts.
+
+**Instances:** a discovery script's TERM trap left its running eval alive
+(SoHoT #805); MCP servers survived restarts, reparented to init, and served a
+stale tool list (SoHoT #1155, RULE #1019); a rate-capped download's nettop spun
+at 1.5 cores for ten hours after its controller was killed (SoHoT #1092). Shown
+in code, not yet bitten: model servers started in their own session by an eval
+runner with no SIGTERM handler (SoHoT #1759).
+
+## A wait with no deadline, owner or end state
+
+**Bitten:** 3.
+
+**Trigger:** does this poll, retry or hold something pending? Is there a
+comparison to a clock or a cap on the loop, does anyone hear when it expires,
+and does it end in a named state? For a state no move leaves, does anything
+other than its writers ever read it to settle, expire or report it?
+
+**Tier:** 1 for loops; 2 for states, with a detector for declared tables.
+
+**Test shape:** hold the condition true forever on a fake clock, and assert the
+wait ends in a named state and that an alert fires. Detectors:
+`undeadlined_wait`, a while loop that sleeps or waits with no comparison to a
+clock set before it and no capped counter, exempted only by a waiver with a
+reason; `terminal_without_reader`, a state with no outgoing move in a move table
+and no reader outside the modules that write it.
+
+**Instances:** an install's queue quiesce waited on the longest running job
+with no deadline or message (SoHoT ERROR #1200, #1762); a reinstall waited on
+another job's GPU lease with no bound (RULE #1476, job 1622; #1763); a job
+paused by the watchdog stayed paused for good because nothing but one caller
+reads that state (FINDING #1028, job 0236; #1764).
+
 ## A check whose input differs between the desk and CI
 
 **Bitten:** 2. The second came twenty minutes after building the fix for the
@@ -684,6 +733,42 @@ than negative.
 **Instance:** a decay parameter reported inert because hits, leaks and top[0]
 did not move. All three are insensitive to ordering by construction, and the
 ordering was what had changed: 10 of the top 15 positions differed.
+
+## A retraction never reaches the actor
+
+**Bitten:** 2.
+
+**Trigger:** has a command, plan or instruction been handed to someone who will
+act on it later? If it is withdrawn, what guarantees they see the withdrawal
+before they act?
+
+**Tier:** 3.
+
+**Test shape:** none mechanical. Put any retraction first, in bold, on the
+channel the actor reads at the moment of acting; never reverse a handed-out
+command mid-message. Assume an actor who read the first version acts on it.
+
+**Instance:** a deploy command was handed out and then retracted further down a
+later message; the deploy ran on the old instruction (2026-10-30, KB NEGATIVE
+on the plan reversal).
+
+## A result produced, never read
+
+**Bitten:** 2.
+
+**Trigger:** did a job, eval or probe finish? Is anything waiting on its
+output, and has anyone opened the output since it landed?
+
+**Tier:** 1 where jobs write a known report path: list finished jobs whose
+report has no recorded read.
+
+**Test shape:** finish a job with a planted report, assert the status lists it
+as unread until it is acknowledged.
+
+**Instances:** the contamination probe (job 0198) finished overnight and its
+report sat unread while later decisions were made; kb-filter reports
+(0182-0184) contradicted a note about #1342's gate that nobody reconciled
+(2026-10-30).
 
 ## A failure mode inferred, not observed
 
@@ -771,41 +856,30 @@ backfilled decision matches its receipt.
 **Instance:** pre-24 adoptions backfilled to whatever spec was on disk at
 migration time, found by the golden stores (#506, RULE #292).
 
-## A retraction never reaches the actor
+## Two durable writes with no repair for the gap
 
-**Bitten:** 2.
+**Bitten:** 1.
 
-**Trigger:** has a command, plan or instruction been handed to someone who will
-act on it later? If it is withdrawn, what guarantees they see the withdrawal
-before they act?
+**Trigger:** does an operation commit a row, file, flag or process and then
+write a second thing that refers to it? What is left if it dies between the
+two, and what repairs it?
 
-**Tier:** 3.
+**Tier:** 1 for commit-then-link; 2 for the repair side, which is a person
+asking what reads the stage a crash leaves once the writer is gone.
 
-**Test shape:** none mechanical. Put any retraction first, in bold, on the
-channel the actor reads at the moment of acting; never reverse a handed-out
-command mid-message. Assume an actor who read the first version acts on it.
+**Test shape:** inject a death between the two writes, run the settle or
+recover path, and assert no duplicate, no stranded flag, and that the stores
+agree. Detectors: `commit_then_link`, a helper that commits and whose returned
+id a second write then stores, with no shared transaction and no dedup key;
+`torn_append`, a line-per-record file appended with no newline repair while its
+reader stops at the first line it cannot parse.
 
-**Instance:** a deploy command was handed out and then retracted further down a
-later message; the deploy ran on the old instruction (2026-10-30, KB NEGATIVE
-on the plan reversal).
-
-## A result produced, never read
-
-**Bitten:** 2.
-
-**Trigger:** did a job, eval or probe finish? Is anything waiting on its
-output, and has anyone opened the output since it landed?
-
-**Tier:** 1 where jobs write a known report path: list finished jobs whose
-report has no recorded read.
-
-**Test shape:** finish a job with a planted report, assert the status lists it
-as unread until it is acknowledged.
-
-**Instances:** the contamination probe (job 0198) finished overnight and its
-report sat unread while later decisions were made; kb-filter reports
-(0182-0184) contradicted a note about #1342's gate that nobody reconciled
-(2026-10-30).
+**Instance:** a deploy switch died mid-flip, leaving the link, the units and
+the store on different releases (SoHoT ERROR #1126, FINDING #1090). Shown in
+code, not yet bitten: deploy migrates, pauses and records in separate steps
+(SoHoT #1752, #1753); a queue hold writes two flags lifted only by an EXIT trap
+(#1754); a re-run's job commits before the row that points at it (#1755,
+#1756); a torn checkpoint line hides every row appended after it (#1757).
 
 ---
 

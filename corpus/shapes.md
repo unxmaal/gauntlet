@@ -9,7 +9,7 @@ on a whole codebase as an inventory, not on a diff.
 This is a candidate pool, like `general-corpus.md`. A question whose inventory
 turns up a real instance graduates into SKILL.md as a class, with its trigger,
 test shape and, where possible, a detector. "A lifecycle with no declared
-state" graduated this way on 2026-11-11.
+state" graduated this way on 2026-11-11, then CR, OW and WT.
 
 ## How to run one
 
@@ -80,16 +80,19 @@ store).
 
 **CR. Crash between writes.** List every operation with more than one durable
 write (row, file, symlink, process). For each gap between two writes, what is
-left if the process dies there, and what repairs it?
+left if the process dies there, and what repairs it? Graduated: SKILL.md "Two
+durable writes with no repair for the gap".
 
 **OW. Ownership.** List every resource created (process, file, lock, lease,
 worktree, row). Who owns it, and who cleans it up when the owner dies?
+Graduated: SKILL.md "A child that outlives its owner".
 
 **CA. Caches.** Is this a copy of something? List every derived file, table
 or in-memory value, its source, and what invalidates it.
 
 **WT. Waits.** List every poll, retry, wait and pending state. Does each have
 a deadline, an owner who is told when it expires, and a named end state?
+Graduated: SKILL.md "A wait with no deadline, owner or end state".
 
 **SE. Side effects.** List every external effect (alert, webhook, push,
 restart, download, message). Can a test, scratch home or branch reach it?

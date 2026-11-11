@@ -30,8 +30,18 @@ def duplicate_ids(reg):
 
 def unknown_detectors(reg, extra=None):
     known = {**detectors.DETECTORS, **(extra or {})}
-    return [f"{cid}: detector {e['detector']} does not exist" for cid, e in reg.index.items()
-            if e.get("detector") and e["detector"] not in known]
+    out = [f"{cid}: detector {e['detector']} does not exist" for cid, e in reg.index.items()
+           if e.get("detector") and e["detector"] not in known]
+    return out + [f"detector_config names {name}, which does not exist" for name in sorted(reg.detector_config)
+                  if name not in known]
+
+
+def detector_config(reg):
+    """The registry's detector_config, with its move tables handed to terminal_without_reader unless it says otherwise."""
+    config = {name: dict(kw) for name, kw in reg.detector_config.items()}
+    if reg.moves:
+        config.setdefault("terminal_without_reader", {}).setdefault("tables", reg.moves)
+    return config
 
 
 def review_gaps(reg):
@@ -49,7 +59,7 @@ def review_gaps(reg):
 def tree_ledger(reg, extra=None):
     kw = {"production": reg.production, "is_test": reg.tests, "lister": reg.files}
     trees = detectors.parse(detectors.sources(reg.root, **kw))
-    hits = detectors.run(trees, reg.index, reg.production, extra)
+    hits = detectors.run(trees, reg.index, reg.production, extra, detector_config(reg))
     marks = detectors.bindings(detectors.sources(reg.root, tests=True, **kw), reg.tests)
     return detectors.ledger(hits, marks, reg.index), marks
 
