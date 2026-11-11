@@ -1042,22 +1042,23 @@ _BY_ID = re.compile(r"(?is)\bWHERE\s+(?:\w+\.)?id\s*(?:=|\bIN\b)")
 _CREATE = re.compile(r"(?is)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)")
 
 
-def _concat(node):
-    # A string chain's text, with each interpolated or concatenated expression kept as its source.
+def _concat(node, hole=None):
+    # A string chain's text, with each interpolated or concatenated expression kept as its source (or as `hole`).
+    def fill(e):
+        return hole if hole is not None else f" {ast.unparse(e)} "
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.JoinedStr):
-        return "".join(v.value if isinstance(v, ast.Constant) else f" {ast.unparse(v.value)} " for v in node.values)
+        return "".join(v.value if isinstance(v, ast.Constant) else fill(v.value) for v in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _concat(node.left), _concat(node.right)
+        left, right = _concat(node.left, hole), _concat(node.right, hole)
         if left is None and right is None:
             return None
-        return (left if left is not None else f" {ast.unparse(node.left)} ") + \
-               (right if right is not None else f" {ast.unparse(node.right)} ")
+        return (left if left is not None else fill(node.left)) + (right if right is not None else fill(node.right))
     return None
 
 
-def _strings(tree):
+def _strings(tree, hole=None):
     # (qualname, line, text) for each outermost string expression: a chain is read whole, never part by part.
     owner = _innermost(tree)
     inner = set()
@@ -1065,7 +1066,7 @@ def _strings(tree):
     for n in _walk(tree):
         if id(n) in inner or not isinstance(n, (ast.Constant, ast.JoinedStr, ast.BinOp)):
             continue
-        text = _concat(n)
+        text = _concat(n, hole)
         if text is None:
             continue
         inner |= {id(m) for m in _walk(n) if m is not n}
@@ -1406,7 +1407,335 @@ def uncached_key(trees, production=default_production):
     return out
 
 
+_LIKE = re.compile(r"(?<![\w.])(?:\w+\.)?(\w+)\s+(?:NOT\s+)?(?:LIKE|GLOB)\b")
+_INSTR = re.compile(r"(?i)\binstr\s*\(\s*(?:\w+\.)?(\w+)")
+_REGEX = {"search", "match", "fullmatch", "findall", "finditer"}
+_TRIMS = {"strip", "lstrip", "rstrip", "lower", "upper", "casefold"}
+
+
+def _field_of(e):
+    # The name a value is kept under: x, obj.x, row["x"], row.get("x"), (x or ""), x.strip().
+    while isinstance(e, ast.Call) and ((isinstance(e.func, ast.Attribute) and e.func.attr in _TRIMS) or (
+            isinstance(e.func, ast.Name) and e.func.id == "str" and len(e.args) == 1)):
+        e = e.func.value if isinstance(e.func, ast.Attribute) else e.args[0]
+    if isinstance(e, ast.BoolOp) and isinstance(e.op, ast.Or):
+        return _field_of(e.values[0])
+    if isinstance(e, ast.Name):
+        return e.id
+    if isinstance(e, ast.Attribute):
+        return e.attr
+    if isinstance(e, ast.Subscript):
+        return _str(e.slice)
+    if isinstance(e, ast.Call) and _call_name(e) == "get" and isinstance(e.func, ast.Attribute) and e.args:
+        return _str(e.args[0])
+    return None
+
+
+def _needle(e):
+    if _str(e) is not None:
+        return True
+    if isinstance(e, ast.Tuple):
+        return bool(e.elts) and all(_needle(x) for x in e.elts)
+    return isinstance(e, (ast.Name, ast.Attribute)) and _upper(e.id if isinstance(e, ast.Name) else e.attr)
+
+
+def _prose_subject(n):
+    # The expression a call or comparison matches a fixed needle against, or None.
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+        name, recv = n.func.attr, n.func.value
+        if name in ("startswith", "endswith") and n.args and _needle(n.args[0]):
+            return recv
+        if name in _REGEX and isinstance(recv, ast.Name) and recv.id == "re" and len(n.args) >= 2:
+            return n.args[1]
+        if name in _REGEX and isinstance(recv, (ast.Name, ast.Attribute)) and n.args and _upper(
+                recv.id if isinstance(recv, ast.Name) else recv.attr):
+            return n.args[0]
+    if isinstance(n, ast.Compare) and len(n.ops) == 1 and isinstance(n.ops[0], (ast.In, ast.NotIn)):
+        if (_str(n.left) or "") and len(_str(n.left)) > 1:
+            return n.comparators[0]
+    return None
+
+
+def prose_match(trees, production=default_production, fields=()):
+    """A decision read back out of a sentence: SQL LIKE/GLOB/instr, startswith/endswith, `"x" in` or a regex on a
+    field the consumer names as stored prose (`fields`, such as note, detail, reason). Finds nothing until told."""
+    fields = set(fields)
+    out = []
+    for rel, tree in _prod(trees, production).items():
+        found = {}
+        for qual, line, text in _strings(tree):
+            if not _SQL_START.search(text):
+                continue
+            for m in list(_LIKE.finditer(text)) + list(_INSTR.finditer(text)):
+                if m.group(1) in fields:
+                    found.setdefault((qual, m.group(1)), (line, "SQL"))
+        owner = _innermost(tree)
+        for n in _walk(tree):
+            subject = _prose_subject(n)
+            field = _field_of(subject) if subject is not None else None
+            if field in fields:
+                found.setdefault((owner.get(id(n), "<module>"), field), (n.lineno, "Python"))
+        for (qual, field), (line, how) in sorted(found.items()):
+            out.append(Hit(f"{rel}:{qual}:{field}", line, f"{how} matches words inside {field}, a sentence the code "
+                           "writes as prose: rewording the writer changes the decision"))
+    return out
+
+
+_EMPTY_CALLS = {"set", "dict", "list", "tuple", "frozenset"}
+_STORE_READS = {"execute", "executemany", "executescript", "fetchone", "fetchall", "fetchmany", "read_text",
+                "read_bytes", "read", "readline", "readlines", "load", "safe_load", "connect", "query"}
+_NONE_SAID = re.compile(r"(?i)\b(?:no|none|nothing|empty)\b")
+_FAILED_SAID = re.compile(r"(?i)could not|cannot|can't|\bfail|\berror|unreadable|unavailable|\bdown\b|\bunknown\b")
+
+
+def _empty(e):
+    if e is None:
+        return True
+    if isinstance(e, ast.Constant):
+        return e.value is None or (e.value in (0, "", b"") and e.value is not False)
+    if isinstance(e, (ast.List, ast.Set, ast.Tuple)):
+        return not e.elts
+    if isinstance(e, ast.Dict):
+        return not e.keys
+    return isinstance(e, ast.Call) and _call_name(e) in _EMPTY_CALLS and isinstance(e.func, ast.Name) and not e.args
+
+
+_STORE_ERRORS = {"OperationalError", "DatabaseError", "ProgrammingError", "InterfaceError", "OSError", "IOError",
+                 "FileNotFoundError", "PermissionError", "JSONDecodeError"}
+
+
+def _store_error(handler):
+    # The handler catches an error only a store, a file or a parse of one raises (sqlite3.Error, OSError, ...).
+    names = [m for m in _walk(handler.type)] if handler.type is not None else []
+    return any((isinstance(m, ast.Name) and m.id in _STORE_ERRORS) or (isinstance(m, ast.Attribute) and (
+        m.attr in _STORE_ERRORS or (m.attr == "Error" and isinstance(m.value, ast.Name)
+                                    and m.value.id in ("sqlite3", "psycopg", "psycopg2")))) for m in names)
+
+
+def _reads_store(nodes):
+    return any(isinstance(n, ast.Call) and (_call_name(n) in _STORE_READS or (
+        isinstance(n.func, ast.Name) and n.func.id == "open")) for n in nodes)
+
+
+def _handler_empties(fn):
+    # (handler, names it sets empty) for each except guarding a store or file read that returns or keeps an empty.
+    returned = {n.value.id for n in _own(fn) if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)}
+    out = []
+    for t in _own(fn):
+        if not isinstance(t, ast.Try):
+            continue
+        reads = _reads_store([m for s in t.body for m in _walk(s)])
+        for h in t.handlers:
+            if not (reads or _store_error(h)):
+                continue
+            inside = [m for s in h.body for m in _walk(s)]
+            if any(isinstance(s, ast.Raise) for s in h.body):
+                continue
+            names = {x.id for m in inside if isinstance(m, ast.Assign) and _empty(m.value)
+                     for x in m.targets if isinstance(x, ast.Name)}
+            if any(isinstance(m, ast.Return) and _empty(m.value) for m in inside) or names & returned:
+                out.append((h, names))
+            elif names:
+                out.append((None, names))
+    return out
+
+
+def _says_none(node):
+    texts = [_concat(m, "") for m in _walk(node) if isinstance(m, (ast.Constant, ast.JoinedStr))]
+    return any(t and _NONE_SAID.search(t) and not _FAILED_SAID.search(t) for t in texts)
+
+
+def _empty_test(test, names):
+    # `not x`, `x is None`, `x == []`, `len(x) == 0`, `not len(x)` on one of `names`.
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = test.operand
+        if isinstance(inner, ast.Call) and _call_name(inner) == "len" and inner.args:
+            inner = inner.args[0]
+        return isinstance(inner, ast.Name) and inner.id in names
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        left = test.left
+        if isinstance(left, ast.Call) and _call_name(left) == "len" and left.args:
+            left = left.args[0]
+        return isinstance(left, ast.Name) and left.id in names and _empty(test.comparators[0]) \
+            and isinstance(test.ops[0], (ast.Is, ast.Eq))
+    return False
+
+
+def empty_on_failure(trees, production=default_production, choosers=()):
+    """Nothing and failed returning the same value: an except around a store or file read that returns an empty
+    literal; a "none found" message shown for a value an except path made empty; and a store chosen by `choosers`
+    (calls such as backend or db_path) in functions copied across more than one module."""
+    prod = _prod(trees, production)
+    out = []
+    emptying = set()
+    for rel, tree in prod.items():
+        for name, fn in _scopes(tree):
+            for h, _ in _handler_empties(fn):
+                if h is not None:
+                    emptying.add(name.rsplit(".", 1)[-1])
+                    out.append(Hit(f"{rel}:{name}:except", h.lineno, "a failed read returns the same empty value as "
+                                   "a read that found nothing; the caller cannot tell them apart"))
+                    break
+    for rel, tree in prod.items():
+        modules = _module_aliases(tree)
+        for name, fn in _scopes(tree):
+            names = {x for _, got in _handler_empties(fn) for x in got}
+            for n in _own(fn):
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _call_name(n.value) in emptying:
+                    f = n.value.func
+                    if isinstance(f, ast.Name) or (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                                                   and f.value.id in modules):
+                        names |= {x.id for x in n.targets if isinstance(x, ast.Name)}
+            hit = next((n for n in _own(fn) if isinstance(n, (ast.If, ast.IfExp)) and _empty_test(n.test, names)
+                        and any(_says_none(b) for b in (n.body if isinstance(n.body, list) else [n.body]))), None)
+            if hit is not None:
+                out.append(Hit(f"{rel}:{name}:none-message", hit.lineno, "a \"none found\" message shown for a value "
+                               "an except path also leaves empty: a failed read is reported as nothing there"))
+    if choosers:
+        homes = {rel for rel, tree in prod.items() for s in tree.body
+                 if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name in choosers}
+        copies = []
+        for rel, tree in prod.items():
+            if rel in homes:
+                continue
+            for name, fn in _scopes(tree):
+                call = next((n for n in _own(fn) if isinstance(n, ast.Call) and _call_name(n) in choosers), None)
+                if call is not None:
+                    copies.append((rel, name, call.lineno))
+        if len({rel for rel, _, _ in copies}) > 1:
+            out += [Hit(f"{rel}:{name}:chooser", line, "a store chosen here as well as elsewhere: each copy can "
+                        "settle on a different store, and the wrong one reads as empty") for rel, name, line in copies]
+    return out
+
+
+_DDL_SKIP = {"PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT"}
+_ALTER_ADD = re.compile(r"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+)")
+_ALTER_DROP = re.compile(r"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)\s+DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(\w+)")
+_DROP_TABLE = re.compile(r"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)")
+_SQL_KIND = re.compile(r"\b(INSERT|REPLACE|UPDATE|DELETE|SELECT)\b")
+_SQL_TARGET = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\b")
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def _ddl_columns(body):
+    # (column, is_key) for each top-level item of a CREATE TABLE body, constraints left out.
+    body = re.sub(r"--[^\n]*", "", body)
+    items, depth, cur = [], 0, ""
+    for ch in body:
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            items.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    items.append(cur)
+    out = []
+    for item in items:
+        m = re.match(r"\s*[\"`\[]?(\w+)", item)
+        if m and m.group(1).upper() not in _DDL_SKIP and "{}" not in m.group(1):
+            out.append((m.group(1), "PRIMARY KEY" in item.upper()))
+    return out
+
+
+def _schema(trees, migrations):
+    # {(table, column): (rel, line, is_key)} from CREATE TABLE and ALTER TABLE in the migration paths, in path order.
+    cols = {}
+    for rel in sorted(r for r in trees if r.startswith(tuple(migrations))):
+        for _, line, text in sorted(_strings(trees[rel], "{}"), key=lambda s: s[1]):
+            for m in _CREATE.finditer(text):
+                start = text.find("(", m.end())
+                if start < 0 or text[m.end():start].strip():
+                    continue
+                depth, end = 0, start
+                for end in range(start, len(text)):
+                    depth += (text[end] == "(") - (text[end] == ")")
+                    if depth == 0:
+                        break
+                for col, key in _ddl_columns(text[start + 1:end]):
+                    cols.setdefault((m.group(1), col), (rel, line, key))
+            for t, c in _ALTER_ADD.findall(text):
+                cols.setdefault((t, c), (rel, line, False))
+            for t, c in _ALTER_DROP.findall(text):
+                cols.pop((t, c), None)
+            for t in _DROP_TABLE.findall(text):
+                cols = {k: v for k, v in cols.items() if k[0] != t}
+    return cols
+
+
+def unpaired_column(trees, production=default_production, migrations=(), schema=()):
+    """A stored column with no live writer or no live reader. The schema is the CREATE TABLE and ALTER TABLE ... ADD
+    in the `schema` paths (by default the `migrations` paths); neither is ever a write or read site. A key read from a
+    row anywhere counts as a read of a table some module selects with *. Finds nothing until told."""
+    if not migrations and not schema:
+        return []
+    cols = _schema(trees, tuple(schema) or tuple(migrations))
+    skip = tuple(schema) + tuple(migrations)
+    tables = {}
+    for t, c in cols:
+        tables.setdefault(t, set()).add(c)
+    written, read = set(), set()
+    dynamic, starred, named, keyed = {}, {}, {}, {}
+    for rel, tree in _prod(trees, production).items():
+        if rel.startswith(skip):
+            continue
+        names, keys = named.setdefault(rel, set()), keyed.setdefault(rel, set())
+        for n in _walk(tree):
+            if isinstance(n, ast.Subscript) and _str(n.slice):
+                keys.add(_str(n.slice))
+            elif isinstance(n, ast.Call) and _call_name(n) == "get" and n.args and _str(n.args[0]):
+                keys.add(_str(n.args[0]))
+            elif isinstance(n, ast.keyword) and n.arg:
+                names.add(n.arg)
+            if _str(n) is not None and _IDENT.fullmatch(_str(n)):
+                names.add(_str(n))
+                if _str(n) in tables:
+                    dynamic.setdefault(_str(n), set()).add(rel)
+                    starred.setdefault(_str(n), set()).add(rel)
+        for _, _, text in _strings(tree, "{}"):
+            kind = _SQL_KIND.search(text)
+            if not kind or not _SQL_TARGET.search(text):
+                continue
+            words = set(_IDENT.findall(text))
+            for t in tables.keys() & words:
+                mine = tables[t]
+                if kind.group(1) in ("INSERT", "REPLACE"):
+                    m = re.search(rf"\bINTO\s+{t}\s*\(([^)]*)\)", text)
+                    if m is None or "{}" in m.group(1):
+                        dynamic.setdefault(t, set()).add(rel)
+                    if m is not None:
+                        written.update((t, c) for c in mine & set(_IDENT.findall(m.group(1))))
+                    tail = text[m.end():] if m else text
+                    upsert = tail.split("DO UPDATE SET", 1)
+                    if len(upsert) == 2:
+                        written.update((t, c) for c in mine if re.search(rf"\b{c}\s*=(?!=)", upsert[1]))
+                    if "SELECT" in upsert[0]:
+                        read.update((t, c) for c in mine & set(_IDENT.findall(upsert[0])))
+                elif kind.group(1) == "UPDATE" and re.search(rf"\bUPDATE\s+{t}\b", text):
+                    sets, _, where = text.partition("SET")[2].partition("WHERE")
+                    if "{}" in sets:
+                        dynamic.setdefault(t, set()).add(rel)
+                    hit = {c for c in mine if re.search(rf"(?<![\w.]){c}\s*=(?!=)", sets)}
+                    written.update((t, c) for c in hit)
+                    read.update((t, c) for c in mine & set(_IDENT.findall(where)))
+                else:
+                    if re.search(r"\bSELECT\s+(?:DISTINCT\s+)?\*|\w\.\*", text):
+                        starred.setdefault(t, set()).add(rel)
+                    read.update((t, c) for c in mine & words)
+    out = []
+    for (t, c), (rel, line, key) in sorted(cols.items()):
+        if (t, c) not in written and not key and not any(c in named[r] for r in dynamic.get(t, ())):
+            out.append(Hit(f"{rel}:{t}.{c}:no-writer", line, f"{t}.{c} is read or kept with nothing that writes it: "
+                           "every reader sees the default, which looks like a real answer"))
+        if (t, c) not in read and not key and not (starred.get(t) and any(c in k for k in keyed.values())):
+            out.append(Hit(f"{rel}:{t}.{c}:no-reader", line, f"{t}.{c} is stored and nothing reads it: a control or "
+                           "a record that nobody consults"))
+    return out
+
+
 DETECTORS = {
+    "prose_match": prose_match,
+    "empty_on_failure": empty_on_failure,
+    "unpaired_column": unpaired_column,
     "unscoped_query": unscoped_query,
     "stored_pid_liveness": stored_pid_liveness,
     "uncached_key": uncached_key,

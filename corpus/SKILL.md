@@ -720,6 +720,54 @@ start-time or command check in the same function.
 #1671, ERROR #1192). Shown in code: a GPU lease holder and a deploy switch
 checked by kill(pid, 0) alone (SoHoT #1772, #1773, fixed by PR #1819).
 
+## A decision read back out of a sentence the code wrote
+
+**Bitten:** 3.
+
+**Trigger:** does code decide what to do by matching a prefix, substring,
+LIKE, GLOB or regex in a note, detail, reason or log field that code also
+writes as prose?
+
+**Tier:** 1 for SQL LIKE/GLOB/instr and startswith on stored prose fields; 2
+for parsing a child process's stderr.
+
+**Test shape:** reword the writer's sentence (or the constant it starts with)
+and assert the reader's decision does not change; red-proof by showing the
+reader flips today. Detector `prose_match`: SQL `LIKE`, `GLOB` or `instr()`,
+`startswith`/`endswith`, `"x" in` or a regex against a field the consumer
+names as stored prose. Blind to needles built from variables, `==` against
+formatted labels, JSON read with `.get`, and SQL written in lowercase.
+
+**Instances:** a deploy was read as superseded from `jobs.note` starting
+"superseded by " (SoHoT #1728, KB #1170); pass-over aging globbed refusal
+prose and went silently off when GLOB was not translated (FINDING #1111 item
+5); an attachment test matched a substring inside a tag and declined full
+models for good (#949, RULE #829). Open: SoHoT #1777-#1779.
+
+## Nothing and failed return the same value
+
+**Bitten:** 3.
+
+**Trigger:** does a read return [], {}, None or 0 both when there is nothing
+and when the read failed or hit the wrong store, and does the caller act on it
+or record it?
+
+**Tier:** 1 for store reads and store choosers; 2 for whether the caller acts
+on the value.
+
+**Test shape:** run the reader against an empty store, an unreadable store and
+the wrong store (a stale file beside the real one); only the first may report
+"none", and the others must say which store they read. Detector
+`empty_on_failure`: an except around a store or file read that returns an
+empty literal; a "none found" message shown for a value an except path leaves
+empty; a store chosen by the consumer's chooser call in more than one module.
+
+**Instances:** a ledger printed "no gateway requests in the window" over a
+store holding thousands of rows (SoHoT ERROR #1254); pass-over aging read a
+failing query as "no pass-overs" (FINDING #1111 item 5); readers that tested
+for the SQLite file read a stale file as the store and recorded its zeros
+(FINDING #1111 items 2 and 9). Open: SoHoT #1781, #1782.
+
 ## A check whose input differs between the desk and CI
 
 **Bitten:** 2. The second came twenty minutes after building the fix for the
@@ -841,6 +889,29 @@ as unread until it is acknowledged.
 report sat unread while later decisions were made; kb-filter reports
 (0182-0184) contradicted a note about #1342's gate that nobody reconciled
 (2026-10-30).
+
+## A stored value with no live writer, or no reader
+
+**Bitten:** 2.
+
+**Trigger:** for each column, file or key this change stores or reads: does
+something live write it, and does something live read it?
+
+**Tier:** 1 for a scan over the schema; 2 for writers that exist but only a
+person calls.
+
+**Test shape:** for a new column, one test that drives its production writer
+and then its production reader in one live path and asserts the reader sees
+the value; for a removed writer, assert the reader went too. Detector
+`unpaired_column`: each column from CREATE TABLE and ALTER TABLE in the
+consumer's migration paths with no INSERT, UPDATE SET or upsert naming it, or
+no read naming it, in production code. Blind to JSON keys, run-dir files, meta
+keys and readers outside the scanned scope.
+
+**Instances:** a delegation's join key, gateway_requests.call_id, had no
+writer on one path, so the ledger reported it unjoined (SoHoT #1721); a
+delegation's outcome had only a manual writer and the accepted share was
+computed over NULLs (SoHoT #1158, KB #686).
 
 ## A failure mode inferred, not observed
 

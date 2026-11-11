@@ -10,7 +10,7 @@ This is a candidate pool, like `general-corpus.md`. A question whose inventory
 turns up a real instance graduates into SKILL.md as a class, with its trigger,
 test shape and, where possible, a detector. "A lifecycle with no declared
 state" graduated this way on 2026-11-11, then CR, OW and WT, then SC, ID and
-CA.
+CA, then FT, EF and WR.
 
 ## How to run one
 
@@ -64,7 +64,8 @@ releases, branches writing a store whose schema is behind them.
 
 **FT. Free-text contracts.** Is a decision carried in prose? List every read
 that matches a prefix, substring or regex in a note, detail, reason or log
-line to decide what to do.
+line to decide what to do. Graduated: SKILL.md "A decision read back out of a
+sentence the code wrote".
 
 **SC. Scope.** Is every query scoped to this machine, home, tenant and lane?
 List every read of a shared table or directory and the scope columns it
@@ -79,7 +80,7 @@ the same process".
 **EF. Empty versus failed.** Does "nothing" look the same as "failed"? List
 every read whose empty, None or zero result is acted on, and what else
 produces that same result (a deleted row, a store that is down, the wrong
-store).
+store). Graduated: SKILL.md "Nothing and failed return the same value".
 
 **CR. Crash between writes.** List every operation with more than one durable
 write (row, file, symlink, process). For each gap between two writes, what is
@@ -102,7 +103,8 @@ Graduated: SKILL.md "A wait with no deadline, owner or end state".
 restart, download, message). Can a test, scratch home or branch reach it?
 
 **WR. Writers and readers.** List every stored value. Does each have both a
-live writer and a live reader?
+live writer and a live reader? Graduated: SKILL.md "A stored value with no
+live writer, or no reader".
 
 **OR. Call order.** List every "A must happen before B" the code relies on
 (env sourcing, migration, connect before backend choice). Is the order
