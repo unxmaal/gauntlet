@@ -1058,6 +1058,23 @@ def _concat(node, hole=None):
     return None
 
 
+_KEYWORDS = frozenset(
+    "select insert update delete replace with into from where set values join left right inner outer cross on "
+    "conflict do nothing or ignore and not null is in like glob create table alter add column drop if exists "
+    "primary key unique foreign references check constraint distinct as order by group having limit returning "
+    "default union all".split())
+_LOWER_SQL = re.compile(r"(?s)^\s*\(?\s*(?:(?:create|alter|drop)\s+(?:table|index|unique)\b|"
+                        r"(?:select|insert|update|delete|replace|with)\b(?=.*\b(?:from|into|set)\b)"
+                        r"(?=.*(?:[=?*(;,]|%s|:\w|\b(?:where|values|join)\b)))")
+
+
+def _sql_case(text):
+    # Lowercase SQL read as SQL: its keywords uppercased, identifiers kept. Prose like "select a job from jobs" is not.
+    if not _LOWER_SQL.match(text):
+        return text
+    return re.sub(r"\b[a-z]+\b", lambda m: m.group(0).upper() if m.group(0) in _KEYWORDS else m.group(0), text)
+
+
 def _strings(tree, hole=None):
     # (qualname, line, text) for each outermost string expression: a chain is read whole, never part by part.
     owner = _innermost(tree)
@@ -1070,7 +1087,7 @@ def _strings(tree, hole=None):
         if text is None:
             continue
         inner |= {id(m) for m in _walk(n) if m is not n}
-        out.append((owner.get(id(n), "<module>"), n.lineno, text))
+        out.append((owner.get(id(n), "<module>"), n.lineno, _sql_case(text)))
     return out
 
 

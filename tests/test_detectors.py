@@ -1,5 +1,6 @@
 """Tier-2 trigger detectors: each fires on its positive fixture and stays quiet on its negative one."""
 
+import re
 from gauntlet import detectors, registry
 
 
@@ -660,12 +661,13 @@ def test_prose_compared_whole_external_text_and_its_blind_spots_are_left_alone()
         "def show(detail):\n    print(detail)\n"
         "def whole(job):\n    return job[\"note\"] == \"superseded\"\n"
         "def variable(job, prefix):\n    return job[\"note\"].startswith(prefix)\n"
-        "def lower(conn):\n    return conn.execute(\"select id from verdicts where detail like 'repo:%'\")\n"
         "def label(conn):\n    return conn.execute(\"SELECT 1 FROM t WHERE title LIKE 'x%'\")\n"
         "def message():\n    return \"refused: the detail GLOB matched nothing\"\n")}
     bad = {"app/r.py": "def f(conn):\n    return conn.execute(\"SELECT 1 FROM t WHERE note GLOB 'x*'\")\n"}
     assert prose_sites(innocent) == []
     assert prose_sites({**innocent, **bad}) == ["app/r.py:f:note"]
+    lower = {"app/l.py": "def g(conn):\n    return conn.execute(\"select id from verdicts where detail like 'repo:%'\")\n"}
+    assert prose_sites({**innocent, **lower}) == ["app/l.py:g:detail"]
 
 
 _LEDGER = ("import json, sqlite3\nfrom app import store, deploy\n"
@@ -915,3 +917,36 @@ def test_reads_at_call_time_a_guarded_entry_and_a_home_set_with_its_backend_are_
     bad = {"app/hf.py": "def main():\n    return models_dir()\n"}
     assert order_sites(innocent, **_ORDER) == []
     assert order_sites({**innocent, **bad}, **_ORDER) == ["app/hf.py:main:no-guard"]
+
+
+_SQL_WORDS = ("SELECT|INSERT|UPDATE|DELETE|REPLACE|INTO|FROM|WHERE|SET|VALUES|JOIN|ON|CONFLICT|DO|AND|OR|IS|NOT|NULL|"
+              "LIKE|GLOB|CREATE|TABLE|IF|EXISTS|ALTER|ADD|COLUMN|DROP|PRIMARY|KEY|UNIQUE|REFERENCES|DEFAULT|INTEGER|"
+              "TEXT|REAL|DISTINCT")
+
+
+def lowered(files):
+    return {k: re.sub(rf"\b(?:{_SQL_WORDS})\b", lambda m: m.group(0).lower(), v) for k, v in files.items()}
+
+
+def test_lowercase_sql_is_read_like_uppercase_sql():
+    scope = {"app/schema.py": _SCHEMA,
+             "app/q.py": ("def pending(conn):\n    return conn.execute(\"SELECT id FROM jobs WHERE argv = ?\").fetchall()\n"
+                          "def mine(conn, m):\n    return conn.execute(\"SELECT id FROM leases WHERE machine_id = ? \"\n"
+                          "                        \"OR machine_id IS NULL\", (m,)).fetchall()\n"
+                          "def g():\n    return \"select a job from jobs\"\n")}
+    assert "update" in lowered({"x": "UPDATE"})["x"]
+    assert scoped_sites(lowered(scope)) == scoped_sites(scope) == ["app/q.py:mine:null-scope", "app/q.py:pending:jobs"]
+    prose = {"app/gate.py": (
+        "def verdict(conn):\n"
+        "    return conn.execute(\"SELECT id FROM verdicts WHERE v.detail LIKE 'repo:%' AND x = 1\").fetchone()\n")}
+    assert prose_sites(lowered(prose)) == prose_sites(prose) == ["app/gate.py:verdict:detail"]
+    cols = {"app/schema.py": _DDL, "app/migrations/v2.py": _MIGRATION, "app/q.py": (
+        "def add(conn, argv, m):\n"
+        "    conn.execute(\"INSERT INTO jobs (argv, machine_id, shown_first) VALUES (?, ?, '') \"\n"
+        "                 \"ON CONFLICT (argv) DO UPDATE SET night_gate = excluded.night_gate\", (argv, m))\n"
+        "def mine(conn, m):\n    return conn.execute(\"SELECT id, argv FROM jobs WHERE machine_id = ?\", (m,))\n"
+        "def annotate(conn, i, n):\n    conn.execute(\"UPDATE jobs SET note = ? WHERE id = ?\", (n, i))\n"
+        "def clearances(conn):\n    return conn.execute(\"SELECT cleared_at, until FROM day_clearances\")\n"),
+        "app/migrations/v3.py": "SQL = \"ALTER TABLE jobs ADD COLUMN said TEXT\"\n"}
+    assert column_sites(lowered(cols)) == column_sites(cols)
+    assert "app/migrations/v3.py:jobs.said:no-writer" in column_sites(cols)
