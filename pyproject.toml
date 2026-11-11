@@ -1,6 +1,6 @@
 [project]
 name = "gauntlet"
-version = "0.3.1"
+version = "0.3.2"
 description = "A corpus of logical failure classes, with the detectors, review heuristics and ratchets that hold a repo to it."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,7 +18,10 @@ hcl = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.17.4",
+]
 
 [build-system]
 requires = ["hatchling"]
