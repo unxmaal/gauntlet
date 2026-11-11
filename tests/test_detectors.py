@@ -1013,3 +1013,117 @@ def test_prose_lifted_by_a_migration_is_left_alone():
     assert prose_sites(files) == ["app/gate.py:held:note", "app/migrations/v9.py:up:note"]
     got = detectors.prose_match(detectors.parse(files), fields=_PROSE, migrations=("app/migrations/",))
     assert sorted(h.site for h in got) == ["app/gate.py:held:note"]
+
+
+_LANES = ("OPEN = (\"queued\", \"held\")\n"
+          "MOVES = {\"hold\": (OPEN, \"held\"), \"start\": ((\"queued\",), \"running\"), \"drop\": (OPEN, \"dropped\")}\n")
+
+
+def test_an_action_table_whose_from_states_is_a_constant_reads_the_constant_s_states():
+    tree = detectors.parse({"app/lanes.py": _LANES})["app/lanes.py"]
+    (_, _, _, table, _), = detectors._found_tables({"app/lanes.py": tree})
+    assert table == {"queued": {"held", "running", "dropped"}, "held": {"held", "dropped"}, "running": set(),
+                     "dropped": set()}
+    report = "def live(rows):\n    return [r for r in rows if r.state == \"running\"]\n"
+    got = sites(detectors.terminal_without_reader, {"app/lanes.py": _LANES, "app/report.py": report})
+    assert got == ["app/lanes.py:MOVES:dropped"]
+
+
+def test_effect_reachable_without_a_live_predicate_finds_no_ungated_call():
+    files = {"app/notify.py": ("import subprocess\ndef desktop(msg):\n    print(msg)\n"
+                               "def morning(msg):\n    desktop(msg)\n"
+                               "def issues():\n    subprocess.run([\"gh\", \"issue\"])\n")}
+    assert effect_sites(files, effects=("desktop",)) == ["app/notify.py:issues:binary:gh"]
+    assert "app/notify.py:morning:desktop" in effect_sites(files, effects=("desktop",), live=("LIVE",))
+
+
+_MODELS = ("from sqlalchemy import Column, ForeignKey, Integer, String, Table\n"
+           "from sqlalchemy.orm import Mapped, mapped_column, relationship\n"
+           "class Job(Base):\n    __tablename__ = \"job\"\n"
+           "    id: Mapped[int] = mapped_column(primary_key=True)\n"
+           "    shop_id: Mapped[int] = mapped_column(ForeignKey(\"shop.id\"))\n"
+           "    argv: Mapped[str]\n    note = Column(String)\n    shop: Mapped[\"Shop\"] = relationship()\n"
+           "class Shop(Base):\n    __tablename__ = \"shop\"\n    id = Column(Integer, primary_key=True)\n"
+           "    name: Mapped[str] = mapped_column(String)\n"
+           "    def label(self):\n        return self.name.title()\n"
+           "tags = Table(\"tag\", Base.metadata, Column(\"id\", Integer, primary_key=True), Column(\"word\", String))\n")
+_ALEMBIC = ("import sqlalchemy as sa\nfrom alembic import op\n"
+            "def upgrade():\n"
+            "    op.create_table(\"lap\", sa.Column(\"id\", sa.Integer, primary_key=True), sa.Column(\"secs\", sa.Float))\n"
+            "    op.add_column(\"job\", sa.Column(\"seen\", sa.Boolean))\n"
+            "    op.add_column(\"job\", sa.Column(\"gone\", sa.Boolean))\n"
+            "    op.drop_column(\"job\", \"gone\")\n"
+            "    op.execute(\"UPDATE job SET seen = false\")\n")
+_ORM_USE = ("from sqlalchemy import select, update\nfrom app.models import Job, Shop\n"
+            "def add(s, shop, argv):\n    s.add(Job(shop_id=shop, argv=argv))\n"
+            "def mine(s, shop):\n    return s.scalars(select(Job).where(Job.shop_id == shop)).all()\n"
+            "def show(job):\n    return job.argv, job.seen\n"
+            "def rename(s, i, n):\n    s.execute(update(Shop).where(Shop.id == i).values(name=n))\n"
+            "def mark(job):\n    job.seen = True\n"
+            "def time(s, secs):\n    s.execute(\"INSERT INTO lap (secs) VALUES (?)\", (secs,))\n"
+            "def laps(s):\n    return s.execute(\"SELECT secs FROM lap\").all()\n"
+            "def words(s):\n    return s.execute(\"SELECT word FROM tag\").all()\n")
+
+
+def test_a_sqlalchemy_and_alembic_schema_is_read_and_its_orm_use_pairs_columns():
+    files = {"app/models.py": _MODELS, "app/migrations/v1.py": _ALEMBIC, "app/q.py": _ORM_USE}
+    cfg = {"schema": ("app/models.py", "app/migrations/"), "migrations": ("app/migrations/",)}
+    assert column_sites(files, **cfg) == ["app/models.py:job.note:no-reader", "app/models.py:job.note:no-writer",
+                                          "app/models.py:tag.word:no-writer"]
+    blind = {**files, "app/q.py": "def show(job):\n    return job.argv\n"}
+    assert "app/migrations/v1.py:job.seen:no-reader" in column_sites(blind, **cfg)
+
+
+def test_a_read_in_a_schema_file_counts_and_a_migration_still_does_not():
+    files = {"app/models.py": _MODELS, "app/q.py": _ORM_USE.replace("def rename", "def _rename")}
+    cfg = {"schema": ("app/models.py",)}
+    assert "app/models.py:shop.name:no-reader" not in column_sites(files, **cfg)
+    assert "app/models.py:shop.name:no-reader" in column_sites(files, schema=(), migrations=("app/models.py",))
+    ddl = {"app/schema.py": ("SCHEMA = \"CREATE TABLE v (id INTEGER PRIMARY KEY, n INTEGER)\"\n"
+                             "def version(c):\n    return c.execute(\"SELECT n FROM v\").fetchone()\n"),
+           "app/w.py": "def bump(c):\n    c.execute(\"UPDATE v SET n = n + 1\")\n"}
+    assert column_sites(ddl, schema=("app/schema.py",), migrations=()) == []
+    assert column_sites(ddl, migrations=("app/schema.py",)) == ["app/schema.py:v.n:no-reader"]
+
+
+def test_an_orm_query_on_a_scoped_model_with_no_scope_is_found():
+    use = ("from sqlalchemy import select, delete\nfrom app.models import Job, Shop\n"
+           "def mine(s, shop):\n    return s.scalars(select(Job).where(Job.shop_id == shop)).all()\n"
+           "def one(s, i):\n    return s.scalars(select(Job).where(Job.id == i)).one()\n"
+           "def every(s):\n    return s.scalars(select(Job.argv)).all()\n"
+           "def purge(s):\n    s.execute(delete(Job).where(Job.argv == \"\"))\n"
+           "def legacy(s):\n    return s.query(Job).filter_by(argv=\"x\").all()\n"
+           "def shops(s):\n    return s.scalars(select(Shop)).all()\n")
+    got = sorted({h.site for h in detectors.unscoped_query(detectors.parse({"app/models.py": _MODELS, "app/q.py": use}),
+                                                           columns=("shop_id",))})
+    assert got == ["app/q.py:every:job", "app/q.py:legacy:job", "app/q.py:purge:job"]
+
+
+_TEAMS = ("from sqlalchemy import ForeignKey, func\nfrom sqlalchemy.orm import Mapped, mapped_column, relationship\n"
+          "class Club(Base):\n    __tablename__ = \"club\"\n    id: Mapped[int] = mapped_column(primary_key=True)\n"
+          "    rosters: Mapped[list[\"Roster\"]] = relationship(back_populates=\"club\", order_by=\"Roster.rank\")\n"
+          "class Roster(Base):\n    __tablename__ = \"roster\"\n    id: Mapped[int] = mapped_column(primary_key=True)\n"
+          "    club_id: Mapped[int] = mapped_column(ForeignKey(\"club.id\"))\n"
+          "    code: Mapped[str] = mapped_column(unique=True)\n    label: Mapped[str]\n    rank: Mapped[int]\n"
+          "    made: Mapped[str] = mapped_column(server_default=func.now())\n"
+          "    club: Mapped[Club] = relationship(back_populates=\"rosters\")\n")
+_TEAM_USE = ("from sqlalchemy import select\nfrom app.models import Club, Roster\n"
+             "def add(s, club, **cols):\n    club.rosters.append(Roster(**cols))\n"
+             "def seed(s, club):\n    add(s, club, code=\"x\", label=\"a\", rank=1)\n"
+             "def show(r):\n    return r.label, r.club.id, r.made\n"
+             "def by_code(s, code):\n    return s.scalars(select(Roster).where(Roster.code == code)).one()\n"
+             "def of(s, club):\n    return s.scalars(select(Roster).where(Roster.club == club)).all()\n"
+             "def by_label(s, label):\n    return s.scalars(select(Roster).where(Roster.label == label)).all()\n")
+
+
+def test_relationships_defaults_kwargs_and_order_by_strings_pair_orm_columns():
+    files = {"app/models.py": _TEAMS, "app/q.py": _TEAM_USE}
+    assert column_sites(files, schema=("app/models.py",), migrations=()) == []
+    unread = {**files, "app/models.py": _TEAMS.replace(", order_by=\"Roster.rank\"", "")}
+    assert column_sites(unread, schema=("app/models.py",), migrations=()) == ["app/models.py:roster.rank:no-reader"]
+
+
+def test_an_orm_lookup_by_a_unique_column_or_through_the_scope_relationship_is_scoped():
+    got = sorted({h.site for h in detectors.unscoped_query(
+        detectors.parse({"app/models.py": _TEAMS, "app/q.py": _TEAM_USE}), columns=("club_id",))})
+    assert got == ["app/q.py:by_label:roster"]

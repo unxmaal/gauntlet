@@ -914,18 +914,38 @@ def _consts(tree):
     return {name: _str(v) for name, v, _ in _assign_targets(tree) if _str(v) is not None}
 
 
-def _action_move(node):
+def _collections(tree):
+    # {name: elements} for module constants bound to a literal collection of state names.
+    out = {}
+    for name, v, _ in _assign_targets(tree):
+        v = _unwrap(v)
+        if isinstance(v, (ast.Set, ast.List, ast.Tuple)) and v.elts and all(_state_ref(e) for e in v.elts):
+            out[name] = v.elts
+    return out
+
+
+def _froms(node, colls):
+    # The elements of a from-states collection, written inline or as a module constant; None for anything else.
+    node = _unwrap(node)
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        return node.elts
+    ident = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+    return colls.get(ident)
+
+
+def _action_move(node, colls):
     # An action's (from-states, to-state) value: a collection of state names, then one state name.
     node = _unwrap(node)
     return (isinstance(node, (ast.Tuple, ast.List)) and len(node.elts) == 2
-            and isinstance(_unwrap(node.elts[0]), (ast.Set, ast.List, ast.Tuple)) and _state_ref(node.elts[1]))
+            and _froms(node.elts[0], colls) is not None and _state_ref(node.elts[1]))
 
 
-def _action_table(value):
-    return isinstance(value, ast.Dict) and bool(value.values) and all(_action_move(v) for v in value.values)
+def _action_table(value, colls):
+    return isinstance(value, ast.Dict) and bool(value.values) and all(_action_move(v, colls) for v in value.values)
 
 
-def _pairs(value):
+def _pairs(value, colls=None):
+    colls = colls or {}
     value = _unwrap(value)
     if isinstance(value, (ast.Set, ast.List, ast.Tuple)):
         return [(e.elts[0], e.elts[1]) for e in value.elts if _state_pair(e)]
@@ -933,8 +953,8 @@ def _pairs(value):
         keys = [k for k in value.keys if k is not None]
         if keys and all(_state_pair(k) for k in keys):
             return [(k.elts[0], k.elts[1]) for k in keys]
-        if _action_table(value):
-            return [(f, _unwrap(v).elts[1]) for v in value.values for f in _unwrap(_unwrap(v).elts[0]).elts]
+        if _action_table(value, colls):
+            return [(f, _unwrap(v).elts[1]) for v in value.values for f in _froms(_unwrap(v).elts[0], colls)]
         out = []
         for k, v in zip(value.keys, value.values):
             inner = _unwrap(v)
@@ -955,7 +975,7 @@ def _table_states(rel, tree, name, value, consts):
         ident = node.id if isinstance(node, ast.Name) else node.attr
         return consts.get(ident, ident), {ident}
     table, names = {}, {}
-    for frm, to in _pairs(value):
+    for frm, to in _pairs(value, _collections(tree)):
         if not (_state_ref(frm) and (to is None or _state_ref(to))):
             continue
         (f, fn), (t, tn) = key(frm), key(to)
@@ -1122,6 +1142,57 @@ def _declared_scoped(prod, columns):
     return out
 
 
+_ORM_QUERY = {"select", "query", "update", "delete"}
+
+
+def _unique(call):
+    return any(k.arg in ("unique", "primary_key") and isinstance(k.value, ast.Constant) and k.value.value is True
+               for k in call.keywords)
+
+
+def _scoped_models(prod, columns):
+    # {model class: (table, its unique and key columns)} for SQLAlchemy models that map a scope column.
+    out = {}
+    for tree in prod.values():
+        for n in _walk(tree):
+            if isinstance(n, ast.ClassDef):
+                table = next((_str(st.value) for st in n.body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                              and getattr(st.targets[0], "id", None) == "__tablename__"), None)
+                mapped = _model_columns(n)
+                if table and {c for c, _, _ in mapped} & set(columns):
+                    keys = {"id"} | {c for c, _, st in mapped if isinstance(st.value, ast.Call) and _unique(st.value)}
+                    via = {a for a, fks, _, _ in _relations(n) if set(fks or [a + "_id"]) & set(columns)}
+                    out[n.name] = (table.lower(), keys, via)
+    return out
+
+
+def _by_key(model, keys, via):
+    # A lookup by a unique or key column, or a filter on the relationship that carries the scope.
+    m, k = re.escape(model), "|".join(map(re.escape, sorted(keys)))
+    rx = rf"\b{m}\.(?:{k})\)?\s*==|\b{m}\.(?:{k})\.in_\(|filter_by\([^)]*\b(?:{k})\s*="
+    if via:
+        v = "|".join(map(re.escape, sorted(via)))
+        rx += rf"|\b{m}\.(?:{v})\s*==|\b{m}\.(?:{v})\.(?:has|is_|in_)\(|filter_by\([^)]*\b(?:{v})\s*="
+    return re.compile(rx)
+
+
+def _orm_queries(tree, models):
+    # (qualname, line, table, by-key pattern, text) for each select/query/update/delete on a model; the text is its
+    # function's.
+    owner, scopes = _innermost(tree), dict(_scopes(tree))
+    out = []
+    for n in _walk(tree):
+        if not (isinstance(n, ast.Call) and _call_name(n) in _ORM_QUERY):
+            continue
+        targets = {getattr(a.value if isinstance(a, ast.Attribute) else a, "id", None) for a in n.args}
+        for m in sorted(targets & models.keys()):
+            qual = owner.get(id(n), "<module>")
+            body = scopes.get(qual)
+            out.append((qual, n.lineno, models[m][0], _by_key(m, *models[m][1:]),
+                        ast.unparse(body if body is not None else n)))
+    return out
+
+
 def _helper_named(rel, qual, helpers):
     return any(h == f"{rel}:{qual}" or h == qual for h in helpers)
 
@@ -1129,17 +1200,23 @@ def _helper_named(rel, qual, helpers):
 def unscoped_query(trees, production=default_production, columns=(), tables=(), helpers=(), null_helper=None):
     """A query on a table several scopes share that does not filter on the scope; and a scope's NULL meaning written
     anywhere but the one helper named for it. `columns` name the scope columns; `tables` add scoped tables to those
-    whose CREATE TABLE names a scope column; `helpers` are fragments that stand for the scope predicate."""
+    whose CREATE TABLE or SQLAlchemy model names a scope column; `helpers` are fragments that stand for the scope
+    predicate. An ORM select, query, update or delete on a scoped model is read with its whole function."""
     if not columns:
         return []
     prod = _prod(trees, production)
-    scoped = {t.lower() for t in tables} | _declared_scoped(prod, columns)
+    models = _scoped_models(prod, columns)
+    scoped = {t.lower() for t in tables} | _declared_scoped(prod, columns) | {t for t, _, _ in models.values()}
     scope = _word(tuple(columns) + tuple(helpers))
     null = re.compile(r"(?i)(?<![\w.])(?:\w+\.)?(" + "|".join(map(re.escape, columns)) + r")\s+IS\s+(?:NOT\s+)?NULL\b")
     refs = re.compile(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+(?i:(" + "|".join(map(re.escape, sorted(scoped))) + r"))\b") \
         if scoped else None
     out = []
     for rel, tree in prod.items():
+        for qual, line, table, by_key, text in _orm_queries(tree, models):
+            if not (scope.search(text) or by_key.search(text)):
+                out.append(Hit(f"{rel}:{qual}:{table}", line, f"a query on {table}, which several scopes share, "
+                               "with no scope predicate: it reads or writes every scope's rows"))
         for qual, line, text in _strings(tree):
             if null.search(text) and not (null_helper and _helper_named(rel, qual, [null_helper])):
                 out.append(Hit(f"{rel}:{qual}:null-scope", line, "the scope's NULL meaning written outside the one "
@@ -1672,11 +1749,99 @@ def _ddl_columns(body):
     return out
 
 
+_ORM_COLUMN = {"Column", "mapped_column"}
+
+
+def _is_key(call):
+    return any(k.arg == "primary_key" and isinstance(k.value, ast.Constant) and k.value.value is True
+               for k in call.keywords)
+
+
+def _named_columns(args):
+    # (column, is_key, call) for each Column("name", ...) among a call's arguments.
+    return [(_str(a.args[0]), _is_key(a), a) for a in args if isinstance(a, ast.Call) and _call_name(a) in _ORM_COLUMN
+            and a.args and _str(a.args[0])]
+
+
+def _fills(call):
+    # A column default the database or the ORM computes: its writer when no code names the column.
+    return any(k.arg in ("default", "server_default", "onupdate") and not isinstance(k.value, ast.Constant)
+               for k in call.keywords)
+
+
+def _relations(cls):
+    # (attribute, foreign key names, target class, back_populates) for each relationship() of a model class.
+    out = []
+    for st in cls.body:
+        if not (isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Call)
+                and _call_name(st.value) == "relationship"):
+            continue
+        target = st.targets[0] if isinstance(st, ast.Assign) else st.target
+        kw = {k.arg: k.value for k in st.value.keywords}
+        fks = [getattr(e, "id", None) or getattr(e, "attr", None) or _str(e)
+               for e in getattr(kw.get("foreign_keys"), "elts", [])]
+        hint = st.value.args[0] if st.value.args else getattr(st, "annotation", None)
+        names = [getattr(n, "id", None) or _str(n) for n in _walk(hint)] if hint is not None else []
+        cls_name = next((n for n in reversed(names) if n and n[:1].isupper() and n not in ("Mapped", "Optional")), None)
+        if isinstance(target, ast.Name):
+            out.append((target.id, [f for f in fks if f], cls_name, _str(kw.get("back_populates"))))
+    return out
+
+
+def _model_columns(cls):
+    # (column, is_key, statement) for each mapped attribute of a declarative model class.
+    out = []
+    for st in cls.body:
+        target = st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else getattr(st, "target", None)
+        if not isinstance(target, ast.Name) or target.id.startswith("__"):
+            continue
+        value = st.value
+        if isinstance(value, ast.Call) and _call_name(value) in _ORM_COLUMN:
+            out.append((target.id, _is_key(value), st))
+        elif value is None and isinstance(st, ast.AnnAssign) and isinstance(st.annotation, ast.Subscript) \
+                and getattr(st.annotation.value, "id", getattr(st.annotation.value, "attr", None)) == "Mapped":
+            out.append((target.id, False, st))
+    return out
+
+
+def _orm(tree):
+    """(events, models, declared) from SQLAlchemy models, Table(...) and Alembic op calls: events are (line, kind,
+    table, column, is_key) with kind add, drop or drop_table; models maps a model class to its table."""
+    events, models, declared = [], {}, set()
+    for n in _walk(tree):
+        if isinstance(n, ast.ClassDef):
+            table = next((_str(st.value) for st in n.body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                          and getattr(st.targets[0], "id", None) == "__tablename__"), None)
+            if table:
+                models[n.name] = table
+                for col, key, st in _model_columns(n):
+                    filled = isinstance(st.value, ast.Call) and _fills(st.value)
+                    events.append((st.lineno, "fill" if filled else "add", table, col, key))
+                    declared |= {id(m) for m in _walk(st)}
+                for attr, fks, target, back in _relations(n):
+                    events.append((n.lineno, "relation", table, attr, (n.name, fks, target, back)))
+        elif isinstance(n, ast.Call) and n.args and _str(n.args[0]):
+            name, table = _call_name(n), _str(n.args[0])
+            if name in ("Table", "create_table", "add_column"):
+                cols = _named_columns(n.args[1:])
+                events += [(n.lineno, "fill" if _fills(c) else "add", table, col, k) for col, k, c in cols]
+                if cols or name != "Table":
+                    declared |= {id(m) for m in _walk(n)}
+            elif name == "drop_column" and len(n.args) > 1 and _str(n.args[1]):
+                events.append((n.lineno, "drop", table, _str(n.args[1]), False))
+            elif name == "drop_table":
+                events.append((n.lineno, "drop_table", table, None, False))
+    return events, models, declared
+
+
 def _schema(trees, migrations):
-    # {(table, column): (rel, line, is_key)} from CREATE TABLE and ALTER TABLE in the migration paths, in path order.
-    cols = {}
+    """({(table, column): (rel, line, is_key)}, ORM tables, {model: table}, {rel: declaration node ids}, filled
+    columns, {relationship attribute: {model: columns it sets}}) from CREATE TABLE and ALTER TABLE text, SQLAlchemy
+    models and Alembic op calls in the migration paths, in path and line order."""
+    cols, orm_tables, models, declared, filled, rels = {}, set(), {}, {}, set(), []
     for rel in sorted(r for r in trees if r.startswith(tuple(migrations))):
-        for _, line, text in sorted(_strings(trees[rel], "{}"), key=lambda s: s[1]):
+        events = []
+        for _, line, text in _strings(trees[rel], "{}"):
             for m in _CREATE.finditer(text):
                 start = text.find("(", m.end())
                 if start < 0 or text[m.end():start].strip():
@@ -1686,35 +1851,97 @@ def _schema(trees, migrations):
                     depth += (text[end] == "(") - (text[end] == ")")
                     if depth == 0:
                         break
-                for col, key in _ddl_columns(text[start + 1:end]):
-                    cols.setdefault((m.group(1), col), (rel, line, key))
-            for t, c in _ALTER_ADD.findall(text):
-                cols.setdefault((t, c), (rel, line, False))
-            for t, c in _ALTER_DROP.findall(text):
+                events += [(line, "add", m.group(1), col, key) for col, key in _ddl_columns(text[start + 1:end])]
+            events += [(line, "add", t, c, False) for t, c in _ALTER_ADD.findall(text)]
+            events += [(line, "drop", t, c, False) for t, c in _ALTER_DROP.findall(text)]
+            events += [(line, "drop_table", t, None, False) for t in _DROP_TABLE.findall(text)]
+        orm, mine, declared[rel] = _orm(trees[rel])
+        models.update(mine)
+        orm_tables |= {t for _, kind, t, _, _ in orm if kind in ("add", "fill")}
+        for line, kind, t, c, key in sorted(events + orm, key=lambda e: e[0]):
+            if kind == "relation":
+                rels.append((t, c, *key))
+            elif kind in ("add", "fill"):
+                cols.setdefault((t, c), (rel, line, key))
+                if kind == "fill":
+                    filled.add((t, c))
+            elif kind == "drop":
                 cols.pop((t, c), None)
-            for t in _DROP_TABLE.findall(text):
+            else:
                 cols = {k: v for k, v in cols.items() if k[0] != t}
-    return cols
+    relations = {}
+    for t, attr, cls, fks, target, back in rels:
+        sets = {(t, f) for f in fks} or {(t, attr + "_id")}
+        if not sets & cols.keys() and target in models and back:
+            sets = {(models[target], back + "_id")}
+        relations.setdefault(attr, {}).setdefault(cls, set()).update(sets & cols.keys())
+    return cols, orm_tables, models, declared, filled, relations
+
+
+def _orm_uses(tree, skip, orm_cols, models, relations, written, read):
+    """Write and read ORM-declared columns: a keyword (a read only in filter_by), an attribute store or load, a
+    relationship read, set or appended to. Returns the tables a model call fills from **kwargs."""
+    dynamic = set()
+    for n in _walk(tree):
+        if id(n) in skip:
+            continue
+        if isinstance(n, ast.Attribute) and n.attr in relations:
+            (written if isinstance(n.ctx, ast.Store) else read).update(c for v in relations[n.attr].values() for c in v)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("append", "extend", "add") \
+                and isinstance(n.func.value, ast.Attribute) and n.func.value.attr in relations:
+            written.update(c for sets in relations[n.func.value.attr].values() for c in sets)
+        ref = _str(n).split(".") if _str(n) and re.fullmatch(r"\w+\.\w+", _str(n)) else None
+        if ref and ref[0] in models and ref[1] in orm_cols:
+            read.update((t, ref[1]) for t in {models[ref[0]]} & orm_cols[ref[1]])
+        if isinstance(n, ast.Attribute) and n.attr in orm_cols:
+            owner = getattr(n.value, "id", None)
+            hit = {models[owner]} & orm_cols[n.attr] if owner in models else orm_cols[n.attr]
+            (written if isinstance(n.ctx, ast.Store) else read).update((t, n.attr) for t in hit)
+        elif isinstance(n, ast.Call):
+            name = _call_name(n)
+            if name in models and any(k.arg is None for k in n.keywords):
+                dynamic.add(models[name])
+            for k in n.keywords:
+                if name in models and k.arg in relations:
+                    written.update(relations[k.arg].get(name, set()))
+                if k.arg not in orm_cols:
+                    continue
+                if name in models:
+                    written.update((t, k.arg) for t in {models[name]} & orm_cols[k.arg])
+                elif name == "filter_by":
+                    read.update((t, k.arg) for t in orm_cols[k.arg])
+                else:
+                    written.update((t, k.arg) for t in orm_cols[k.arg])
+    return dynamic
 
 
 def unpaired_column(trees, production=default_production, migrations=(), schema=()):
     """A stored column with no live writer or no live reader. The schema is the CREATE TABLE and ALTER TABLE ... ADD
-    in the `schema` paths (by default the `migrations` paths); neither is ever a write or read site. A key read from a
-    row anywhere counts as a read of a table some module selects with *. Finds nothing until told."""
+    text, SQLAlchemy models and Alembic op calls in the `schema` paths (by default the `migrations` paths). A migration
+    is never a write or read site; in a `schema` file only the declarations are skipped. A key read from a row anywhere
+    counts as a read of a table some module selects with *. Finds nothing until told."""
     if not migrations and not schema:
         return []
-    cols = _schema(trees, tuple(schema) or tuple(migrations))
-    skip = tuple(schema) + tuple(migrations)
+    cols, orm_tables, models, declared, filled, relations = _schema(trees, tuple(schema) or tuple(migrations))
     tables = {}
     for t, c in cols:
         tables.setdefault(t, set()).add(c)
-    written, read = set(), set()
+    orm_cols = {}
+    for t in orm_tables & tables.keys():
+        for c in tables[t]:
+            orm_cols.setdefault(c, set()).add(t)
+    written, read = set(filled), set()
     dynamic, starred, named, keyed = {}, {}, {}, {}
     for rel, tree in _prod(trees, production).items():
-        if rel.startswith(skip):
+        if rel.startswith(tuple(migrations)) and not (schema and rel.startswith(tuple(schema))):
             continue
+        skip = declared.get(rel, set())
         names, keys = named.setdefault(rel, set()), keyed.setdefault(rel, set())
+        for t in _orm_uses(tree, skip, orm_cols, models, relations, written, read):
+            dynamic.setdefault(t, set()).add(rel)
         for n in _walk(tree):
+            if id(n) in skip:
+                continue
             if isinstance(n, ast.Subscript) and _str(n.slice):
                 keys.add(_str(n.slice))
             elif isinstance(n, ast.Call) and _call_name(n) == "get" and n.args and _str(n.args[0]):
@@ -1728,7 +1955,7 @@ def unpaired_column(trees, production=default_production, migrations=(), schema=
                     starred.setdefault(_str(n), set()).add(rel)
         for _, _, text in _strings(tree, "{}"):
             kind = _SQL_KIND.search(text)
-            if not kind or not _SQL_TARGET.search(text):
+            if not kind or not _SQL_TARGET.search(text) or _CREATE.search(text) or _ALTER_ADD.search(text):
                 continue
             words = set(_IDENT.findall(text))
             for t in tables.keys() & words:
@@ -1955,7 +2182,7 @@ def effect_reachable(trees, production=default_production, effects=(), live=(), 
     """An effect reachable from a run that is not the live deploy: a call to an effect the consumer names (`effects`,
     such as alert, post, push, restart) where neither the caller nor the effect's own definition consults a live-run
     predicate (`live`); an effect bound as a default argument, out of reach of any stub; and a spawn of an effect
-    binary (`binaries`) that the test guard's list (`guarded`) lacks."""
+    binary (`binaries`) that the test guard's list (`guarded`) lacks. With no `live` the first check finds nothing."""
     prod = _prod(trees, production)
     effects, live, guarded, binaries = tuple(effects), set(live), set(guarded), set(binaries)
     owners = {}  # an effect's bare name -> the modules a dotted effect names, or None when any module may define it
@@ -1979,7 +2206,7 @@ def effect_reachable(trees, production=default_production, effects=(), live=(), 
         for n in _walk(tree):
             qual = owner.get(id(n), "<module>")
             name = _named(n.func, effects) if isinstance(n, ast.Call) else None
-            if name:
+            if name and live:
                 fn = scopes.get(qual)
                 if not (gated.get(name.rsplit(".", 1)[-1]) or (fn is not None and live & _names_in(fn))):
                     found.setdefault(f"{rel}:{qual}:{name}", Hit(f"{rel}:{qual}:{name}", n.lineno, f"{name} runs "

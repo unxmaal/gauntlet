@@ -27,7 +27,7 @@ CONFIG_TODOS = {
     "unchecked_order": 'effects, import-time reads: {"effects": (), "reads": ()}',
     "prose_match": 'fields that hold prose: {"fields": ("note", "reason")}',
     "empty_on_failure": 'functions that choose a store: {"choosers": ("backend",)}',
-    "unpaired_column": 'migrations, schema: {"migrations": ("db/",), "schema": ()}',
+    "unpaired_column": 'migrations, models: {"migrations": ("db/",), "schema": ()}',
     "one_sided_schema_check": 'versions, check entry points: {"versions": (), "phases": ()}',
     "stored_pid_liveness": 'pid tests besides os.kill(pid, 0): {"alive": ("running",)}',
     "commit_then_link": 'committers besides conn.commit(): {"committers": ("put",)}',
