@@ -1,6 +1,7 @@
 """The registry binds a repo's defects to the skill's classes, and the skill parser reads the corpus."""
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -207,3 +208,14 @@ def test_parse_skill_reads_the_corpus_in_this_repo(monkeypatch):
     assert len({c["id"] for c in got}) == len(got), "two classes in the corpus share an id"
     assert all(c["tier"] in (1, 2, 3) for c in got)
     assert all(c["trigger"] for c in got if c["source"] == "SKILL.md"), "a SKILL.md class has no trigger"
+
+
+def test_the_corpus_is_ordered_by_bite_count_and_names_only_detectors_that_exist():
+    from gauntlet import detectors
+    classes = [c for c in skill.read_skill(REPO / "corpus") if c["source"] == "SKILL.md"]
+    counts = [c["bitten"] for c in classes]
+    assert None not in counts, "a SKILL.md class has no bare-integer Bitten"
+    assert [c["id"] for c in classes] == [c["id"] for c in sorted(classes, key=lambda c: -c["bitten"])]
+    text = (REPO / "corpus" / "SKILL.md").read_text(encoding="utf-8")
+    named = set(re.findall(r"[Dd]etectors?:?\s*`(\w+)`", text)) | set(re.findall(r";\s*`(\w+)`, a", text))
+    assert named and named <= set(detectors.DETECTORS), named - set(detectors.DETECTORS)

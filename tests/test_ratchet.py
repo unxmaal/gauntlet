@@ -133,6 +133,22 @@ def test_a_registry_problem_an_unknown_detector_and_a_missing_heuristic_each_fai
         "test_gauntlet_registry_is_clean", "test_gauntlet_review_heuristics_are_present_and_quiet"]
 
 
+def test_the_registry_configures_a_detector_and_hands_its_move_tables_to_terminal_without_reader(consumer):
+    reg, skill_dir = consumer
+    from gauntlet.moves import MoveTable
+    (reg.root / "app" / "q.py").write_text('def add(conn):\n    return 1\ndef f(conn):\n    k = add(conn)\n'
+                                           '    conn.execute("INSERT INTO r (k) VALUES (?)", (k,))\n', encoding="utf-8")
+    reg.index[CLOSED]["detector"] = "commit_then_link"
+    assert ratchet.tree_ledger(reg)[0][CLOSED]["unbound"] == []
+    reg.detector_config = {"commit_then_link": {"committers": ("add",)}}
+    assert ratchet.tree_ledger(reg)[0][CLOSED]["unbound"] == ["app/q.py:f"]
+    reg.moves = (MoveTable("app/t.py:MOVES", {"a": {"b"}}, initial=["a"]),)
+    assert ratchet.detector_config(reg)["terminal_without_reader"]["tables"] == reg.moves
+    assert reg.detector_config == {"commit_then_link": {"committers": ("add",)}}
+    reg.detector_config["no_such"] = {}
+    assert ratchet.unknown_detectors(reg) == ["detector_config names no_such, which does not exist"]
+
+
 def test_a_consumer_detector_runs_beside_the_package_s(consumer):
     reg, skill_dir = consumer
     from gauntlet import detectors
