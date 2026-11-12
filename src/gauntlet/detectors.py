@@ -1,6 +1,7 @@
 """Trigger detectors for tier-2 classes: each takes {rel: ast.Module} and finds the sites where a trigger fires."""
 
 import ast
+import collections
 import re
 from collections import namedtuple
 from pathlib import Path
@@ -45,19 +46,35 @@ def _upper(name):
     return bool(re.fullmatch(r"_?[A-Z][A-Z0-9_]*", name or ""))
 
 
-_WALKED: dict = {}
+_MEMO: dict = {}
+BUILDS: collections.Counter = collections.Counter()
 
 
+def _per_node(build):
+    # Build once per node: every detector asks the same questions of the same trees. Callers must not mutate results.
+    memo = _MEMO.setdefault(build.__name__, {})
+
+    def get(node):
+        got = memo.get(id(node))
+        if got is None or got[0] is not node:
+            BUILDS[build.__name__] += 1
+            got = memo[id(node)] = (node, build(node))
+        return got[1]
+    return get
+
+
+@_per_node
 def _walk(node):
-    # ast.walk as a list, built once per node: every detector walks the same trees.
-    got = _WALKED.get(id(node))
-    if got is None or got[0] is not node:
-        got = _WALKED[id(node)] = (node, list(ast.walk(node)))
-    return got[1]
+    return list(ast.walk(node))
 
 
+@_per_node
 def _scopes(tree):
     # (qualname, node) for every function, so a hit can name the function it sits in.
+    return list(_scope_walk(tree))
+
+
+def _scope_walk(tree):
     def walk(node, prefix):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -71,6 +88,7 @@ def _scopes(tree):
     yield from walk(tree, "")
 
 
+@_per_node
 def _innermost(tree):
     # node id -> qualname of the innermost function holding it, in one traversal.
     owner = {}
@@ -502,6 +520,7 @@ def move_tables(trees, production=default_production):
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
 
+@_per_node
 def _own(node):
     # Every node under `node` that is not inside a nested function or class.
     out, todo = [], list(ast.iter_child_nodes(node))
