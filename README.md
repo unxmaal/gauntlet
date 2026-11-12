@@ -1,45 +1,186 @@
 # gauntlet
 
-A corpus of logical failure classes that have bitten real code, each with a trigger question and a test shape,
-plus the Python machinery that holds a repo to it: the skill parser, AST detectors for tier-2 classes, text
-scanners for tier-1 classes, review heuristics for a diff, the audit, the mutation ratchet and the
-inventory-format check.
+gauntlet finds logic flaws that ordinary tests miss, and stops a repo from adding new ones.
 
-- `corpus/`: `SKILL.md`, `general-corpus.md`, `shapes.md`, the Stop hook and its test. This is the Claude skill.
-- `src/gauntlet/`: the package. Standard library only; the HCL front end needs the `hcl` extra (python-hcl2).
+Unit tests check that code does what its author meant. They don't check whether the author meant the right thing.
+Most bugs that reach production are of the second kind. Two files each hold their own copy of a setting, and the
+copies drift apart. A query forgets which tenant it belongs to. A process ID is saved to disk and later trusted after
+the operating system has reused it. A state machine has a state that nothing ever leaves. Each of these looks like a
+one-off when it happens. They aren't one-offs: the same few shapes keep coming back in different code.
 
-## Install
+gauntlet writes those shapes down and checks code against them. It has two parts:
 
-The skill: symlink the skill directory to this checkout's corpus.
+- **The corpus** (`corpus/`): a list of failure classes. Each one is a kind of logic flaw that has caused at least
+  one real bug. Each entry gives a trigger question, a test shape, and the real instances that earned it a place.
+  The corpus is also a Claude Code skill, so an agent can apply it while writing or reviewing code.
+- **The package** (`src/gauntlet/`): Python code that finds those classes mechanically and turns them into failing
+  tests in your repo. It uses only the standard library; reading Terraform needs the `hcl` extra.
 
+## Why use it
+
+- **It catches what linters and type checkers don't.** Those tools check one line or one function at a time. The
+  flaws here span files: a value defined in two places, a column written but never read, a guard function with no
+  caller, an effect a test run can trigger against live state.
+- **It adopts without a cleanup project.** `gauntlet init` records every existing hit as a backlog. Your suite
+  passes on day one, and from then on only new hits fail. The backlog can only shrink.
+- **Every hit leaves a decision behind.** You can't silence a hit. You bind a test that proves the site is safe,
+  or you waive it with a written reason, and both are checked on every run. A binding or waiver whose site has gone
+  away also fails, so the record can't go stale.
+- **It is versioned.** A repo pins a gauntlet tag. The corpus ships inside the package, so your tests run against
+  the version you pinned, not whatever a laptop has installed.
+
+## How it works
+
+### The corpus
+
+Each class in `corpus/SKILL.md` looks like this (shortened):
+
+> **One question, two answers**
+> **Trigger:** is this value, list, or policy written down in more than one place?
+> **Tier:** 1 where the copies can be parsed; 2 otherwise.
+> **Test shape:** read both copies from source and assert they agree.
+> **Instances:** a model list forked into a shell file and a Python file; ...
+
+The **tier** says how the class can be checked:
+
+| tier | meaning | how gauntlet checks it |
+|---|---|---|
+| 1 | One repo-wide scan covers every file, including files not written yet. | A scanner in `gauntlet.scanners` that a repo runs as a test. |
+| 2 | Has to be judged at each site where the trigger fires. | An AST detector finds candidate sites; each site needs a bound test or a waiver. |
+| 3 | Can't be mechanised. A test would pass while the reasoning was still wrong. | A review question raised on a diff, answered by a person. |
+
+`general-corpus.md` holds candidate classes taken from general experience rather than from a real bug here. A
+candidate moves into `SKILL.md` once it causes a real bug. `shapes.md` holds whole-codebase inventory questions,
+such as "list every lifecycle" or "list every query's scope", in one standard file format.
+
+### The machinery
+
+- **Detectors** (`gauntlet.detectors`, Python AST; `gauntlet.hcl`, Terraform). Each one reports *sites*, such as
+  `app/jobs.py:claim`, where a class may apply. A detector reports candidates, not verdicts.
+- **Scanners** (`gauntlet.scanners`) run over every file, for tier-1 classes: swallowed exceptions, unchecked exit
+  codes in shell scripts, mutable default arguments, bare `bash` calls, platform-specific primitives and similar.
+  Each one comes with an inventory count pinned in your tests, and the count may only go down.
+- **Review heuristics** (`gauntlet review`). Each tier-3 class can carry a regex. The command checks the lines a
+  diff adds, and when one matches, it prints that class's trigger and test shape for a person to answer.
+- **The registry** (yours, in `tests/gauntlet/registry.py`). It records which classes your repo holds itself to,
+  what counts as production code, your waivers, your backlog, and your defect history.
+- **The ratchet tests** (`gauntlet.ratchet`) turn all of the above into ordinary pytest tests. See the next section.
+- **The audit** (`gauntlet audit`) reads your closed defect issues and merged PRs and lists each fixed defect that
+  no class covers. That gap is how the corpus grows: name the general flaw behind the defect, then add it.
+- **Mutation testing** (`gauntlet mutation`) runs mutmut on your core modules and pins the surviving mutants, so
+  the tests can't quietly get weaker.
+- **The Stop hook** (`corpus/stop-hook.sh`). Registered as a Claude Code Stop hook, it makes an agent whose turn
+  changed source code answer the corpus triggers for the changed files before the turn can end.
+
+### Following one hit through
+
+1. Someone adds `DEVICES = ("cpu", "mps")` to a second module. The `duplicated_literals` detector reports both
+   sites under `one-question-two-answers`.
+2. Neither site is bound, waived or in the backlog, so this test fails:
+
+       one-question-two-answers: app/b.py:DEVICES
+           bind a test with @pytest.mark.gauntlet("one-question-two-answers", site="app/b.py:DEVICES") or waive it with a reason
+
+3. You choose one:
+   - **Fix it.** Import the tuple from one place. The hit goes away.
+   - **Bind it.** Write a test that proves the copies agree, and mark it
+     `@pytest.mark.gauntlet("one-question-two-answers", site="app/b.py:DEVICES")`.
+   - **Waive it.** In the registry index, add
+     `"waivers": {"app/b.py:DEVICES": "unrelated: a list of CI runners, not a device policy"}`.
+4. Later someone deletes `app/b.py`. The binding or waiver now points at nothing, so the stale-binding test fails
+   until you remove it.
+
+## The tests it adds to your repo
+
+`globals().update(gauntlet.ratchet.tests(REGISTRY))` in `tests/test_gauntlet.py` adds these:
+
+| test | fails when | what to do |
+|---|---|---|
+| `test_gauntlet_no_new_code_trips_a_detector_without_a_bound_test` | A detector reports a site that has no bound test, no waiver and no backlog entry. | Fix the code, bind a test to the site, or waive it with a reason. |
+| `test_gauntlet_the_backlog_only_shrinks` | A backlog site has been fixed, bound or waived but is still listed, or the backlog's size differs from `backlog_pin`. | Remove the row and lower `backlog_pin` to the count the message gives. |
+| `test_gauntlet_no_binding_or_waiver_is_stale` | A binding or waiver names a site the detectors no longer report, or a test is bound to a class with no detector. | Delete the binding or waiver. |
+| `test_gauntlet_registry_is_clean` | An index entry names a class missing from the corpus, lacks `instances` or `scanners`, has a waiver with no reason, or names a scanner that doesn't exist; or a defect in the snapshot has no class and no reason. | Fix the registry entry the message names. |
+| `test_gauntlet_snapshot_is_the_pinned_corpus` | The corpus your pinned gauntlet ships differs from `skill_classes.json`. This happens after you move to a new tag. | Run `gauntlet snapshot-skill --registry ...` and review the diff. |
+| `test_gauntlet_ids_are_unique` | Two classes share an id, or a pending class is now defined in the corpus. | Rename the class, or move it from pending into the index. |
+| `test_gauntlet_every_named_detector_exists` | The index or `detector_config` names a detector that doesn't exist. Usually a typo, or a detector renamed in a new tag. | Correct the name. |
+| `test_gauntlet_review_heuristics_are_present_and_quiet` | A review-only class has no `review` regex, or its regex matches ordinary code such as `import os`. | Add a regex, or make it narrower. |
+| `test_gauntlet_every_move_table_is_sound` | A declared state machine has an unreachable state, a non-terminal dead end, a terminal state that moves without a named reopen, or a state it never names. | Fix the table or the code it describes. |
+| `test_gauntlet_every_move_table_is_registered` | A constant named `MOVES`, `TRANSITIONS` or `*_MOVES` holds state transitions but has no `MoveTable` and no waiver. | Register it in `Registry(moves=...)` or waive it in `move_waivers`. |
+
+Each failure message lists every offending site, so one run shows the whole list.
+
+### What the Python detectors look for
+
+| detector | class | fires on |
+|---|---|---|
+| `duplicated_literals` | one-question-two-answers | the same literal list written down in two modules |
+| `closed_tables` | a-closed-table-fronting-an-open-set | a fixed table of names looked up with a fallback or a membership test, so an unlisted name silently gets a default |
+| `unreached_guards` | a-guard-built-and-tested-that-nothing-invokes | a check or guard function that no production code calls |
+| `ignored_options` | an-input-accepted-and-silently-ignored | a command-line option that is parsed and never read |
+| `member_defaults` | one-default-tuned-for-one-member-applied-to-all | one constant used as the default for a value that differs per model or machine |
+| `harness_verdicts` | a-fact-about-the-harness-recorded-as-a-verdict-on-the-subject | a final verdict written from an exception or exit status, which may be the harness's fault and not the subject's |
+| `env_seams` | each-half-verified-against-its-own-spec-the-seam-against-nothing | an environment variable read in one place and set in another, a handoff that each side's tests miss |
+| `loopback_equality` | identity-by-name-not-by-content | an equality test against a `localhost` URL used to decide which server is on the other end |
+| `one_sided_schema_check` | a-deploy-runs-two-releases-at-once | a schema version check made on only one side of a deploy |
+| `effect_reachable` | an-effect-reachable-from-a-run-that-is-not-the-live-deploy | a real side effect (alerts, `launchctl`, `gh`, `ssh`) that a test or dev run can reach |
+| `unchecked_order` | an-order-the-code-needs-but-does-not-check | code that needs setup to happen first, such as environment reads at import, with nothing enforcing the order |
+| `prose_match` | a-decision-read-back-out-of-a-sentence-the-code-wrote | a decision made by matching text the program itself wrote as prose |
+| `empty_on_failure` | nothing-and-failed-return-the-same-value | a function that returns the same empty value for "nothing found" and "it broke" |
+| `unpaired_column` | a-stored-value-with-no-live-writer-or-no-reader | a column (SQL or ORM) that nothing writes, or that nothing reads |
+| `unscoped_query` | a-shared-store-query-with-no-scope-or-a-scope-with-its-own-idea-of-null | a query on a shared table that leaves out the tenant or machine scope |
+| `stored_pid_liveness` | a-stored-pid-trusted-as-the-same-process | a saved PID checked only with `os.kill(pid, 0)`, which is true for any process that later reuses the PID |
+| `uncached_key` | a-copy-whose-key-leaves-out-an-input-or-that-nothing-invalidates | a cache over files or subprocesses whose key leaves out an mtime or other input, or a JSON file rewritten with no lock |
+| `commit_then_link`, `torn_append` | two-durable-writes-with-no-repair-for-the-gap | two writes that must both land, with nothing to repair a crash between them |
+| `orphanable_child` | a-child-that-outlives-its-owner | a subprocess that can keep running after its parent dies |
+| `undeadlined_wait`, `terminal_without_reader` | a-wait-with-no-deadline-owner-or-end-state | a loop or wait with no deadline, or a terminal state nothing reads |
+| `row_index_keys` | order-assumed-on-unordered-data | a dict keyed on an `enumerate()` index, which pairs rows by list position instead of identity |
+| `latest_row_state` | state-is-whichever-row-came-last | current state read from the newest row of an append-only table |
+| `unguarded_transition` | a-lifecycle-with-no-declared-state | an `UPDATE` that sets a state or status with no `WHERE` on the state it leaves, or one state column written from several modules |
+
+Most detectors work with no configuration. The ones that need to know your repo's names (the scope column, the
+migration path, the effect functions) find nothing until `detector_config` tells them; see below. The Terraform
+detectors are listed under "Findings, front ends and other tools' output".
+
+## Quick start
+
+Install the skill, so Claude Code sessions load the corpus:
+
+    git clone https://github.com/unxmaal/gauntlet && cd gauntlet
     ln -sfn "$PWD/corpus" ~/.claude/skills/gauntlet
 
-The package, pinned to a tag:
+Wire a repo, from its top directory:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.1"
-    gauntlet classes          # the corpus this version ships
-    gauntlet corpus-dir       # where it lives
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.5" gauntlet init
+    uv sync && uv run pytest tests/test_gauntlet.py
+
+`corpus/INSTALL.md` is the same procedure as a step-by-step runbook, including how to move a wired repo to a new
+tag. To look at the package without wiring anything:
+
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.5"
+    gauntlet classes          # the classes this version ships
+    gauntlet corpus-dir       # where its copy of the corpus lives
 
 The installed package carries its own copy of the corpus, so a consumer's tests read the pinned version and not
 whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
-## Wiring a repo with `gauntlet init`
+### What `gauntlet init` writes
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.1" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.5" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
 
 In a Python repo it adds the pin to `[dependency-groups] dev` in `pyproject.toml`, never to an extra (with
 `python_version >= '3.12'` when `requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`,
 `tests/test_gauntlet.py`, the skill snapshot, an empty defects snapshot and a backlog of today's hits, so the first
 run passes and only a new hit fails. The index holds every corpus class a detector covers; `hcl` joins the front
-ends when the repo has `.tf` files. What init cannot know (production paths, `detector_config` values, move tables)
-is a `# TODO(gauntlet):` line in the registry. It refuses to overwrite a registry without `--force`, writes nothing
+ends when the repo has `.tf` files. Anything init can't work out for itself (production paths, `detector_config`
+values, move tables) becomes a `# TODO(gauntlet):` line in the registry. It refuses to overwrite a registry without `--force`, writes nothing
 unless every file was computed, prints how many ratchet tests to expect, and warns where `requires-python` or a CI
 workflow runs Python below 3.12. A Terraform repo with no `pyproject.toml` gets the minimal form instead:
 `.gauntlet/baseline.json` and `.gauntlet/check.sh`, which runs `gauntlet scan --frontend hcl --baseline
 .gauntlet/baseline.json` and fails on a finding not in the baseline.
-`corpus/INSTALL.md` is the same as a runbook, step by step.
 
-## Wiring a consumer's registry by hand
+## Reference
+
+### Wiring a registry by hand
 
 The registry stays in the consumer's repo: class instances, waivers, the detector backlog, the defects snapshot
 and what counts as production code. Describe it once:
@@ -119,7 +260,7 @@ loop or child is a
 waiver with a reason in the class's index entry, like any other site. New code is held at zero; a consumer's
 existing hits go in its backlog.
 
-## Findings, front ends and other tools' output
+### Findings, front ends and other tools' output
 
 Every front end and adapter emits one format, `{class, site, line, why, tool, rule}`, as JSON or SARIF 2.1.0, so
 code scanning can show it without the gauntlet installed:
@@ -163,10 +304,14 @@ The CLI takes the same object:
 `--config` names a `gauntlet.mutation.MutationConfig`: the modules to mutate, the tests selected for each, the
 pin file, and any environment the tree needs.
 
-## Development
+## Developing gauntlet itself
 
-    uv sync
+    uv sync --all-extras
     uv run pytest
+
+The repo's own tests cover each detector with a fixture it must fire on and one it must not, the ratchets, `init`
+against throwaway repos, the HCL front end and adapters, the mutation runner, and a privacy check that no tracked
+file names a local user, host, home path or IP address. CI runs them on Python 3.12.
 
 ## License
 
