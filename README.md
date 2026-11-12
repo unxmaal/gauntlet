@@ -167,3 +167,7 @@ pin file, and any environment the tree needs.
 
     uv sync
     uv run pytest
+
+## License
+
+MIT. See `LICENSE`.
