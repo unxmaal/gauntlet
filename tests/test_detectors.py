@@ -1127,3 +1127,15 @@ def test_an_orm_lookup_by_a_unique_column_or_through_the_scope_relationship_is_s
     got = sorted({h.site for h in detectors.unscoped_query(
         detectors.parse({"app/models.py": _TEAMS, "app/q.py": _TEAM_USE}), columns=("club_id",))})
     assert got == ["app/q.py:by_label:roster"]
+
+
+def test_tree_helpers_are_built_once_per_node_however_many_detectors_ask():
+    files = {"app/js.py": _STATES, "app/wq.py": _WRITER, "app/report.py": _REPORT, "app/models.py": _MODELS,
+             "app/q.py": _ORM_USE, "app/booking.py": _BOOKING}
+    trees = detectors.parse(files)
+    index = {name: {"detector": name} for name in detectors.DETECTORS}
+    first = detectors.run(trees, index)
+    built = dict(detectors.BUILDS)
+    assert {"_walk", "_scopes", "_own", "_innermost"} <= {k for k, v in built.items() if v}
+    assert detectors.run(trees, index) == first
+    assert dict(detectors.BUILDS) == built
