@@ -1197,3 +1197,38 @@ def test_tree_helpers_are_built_once_per_node_however_many_detectors_ask():
     assert {"_walk", "_scopes", "_own", "_innermost"} <= {k for k, v in built.items() if v}
     assert detectors.run(trees, index) == first
     assert dict(detectors.BUILDS) == built
+
+
+def _calls(fn, *args, **kw):
+    import sys
+    count = [0]
+
+    def tally(frame, event, arg):
+        if event == "call":
+            count[0] += 1
+    sys.setprofile(tally)
+    try:
+        got = fn(*args, **kw)
+    finally:
+        sys.setprofile(None)
+    return got, count[0]
+
+
+def _lanes(n):
+    # n modules, each with its own move table, a writer of its terminal state and a reader of its neighbour's.
+    files = {}
+    for i in range(n):
+        files[f"app/m{i}.py"] = (
+            f"RUN = \"{n}\"\nOPEN{i} = \"open{i}\"\nDONE{i} = \"done{i}\"\n"
+            f"MOVES = {{OPEN{i}: {{DONE{i}}}, DONE{i}: set()}}\n"
+            f"def finish(conn, k):\n    conn.execute(\"UPDATE t SET s = 'done{i}' WHERE id = ?\", (k,))\n"
+            f"    return [r for r in conn.rows() if r.s == 'done{i + 1}' or r.kind in ('a', 'b')]\n")
+    return detectors.parse(files)
+
+
+def test_terminal_without_reader_costs_calls_linear_in_the_tree_however_many_tables_it_holds():
+    small, big = _lanes(30), _lanes(60)
+    hits_small, cost_small = _calls(detectors.terminal_without_reader, small)
+    hits_big, cost_big = _calls(detectors.terminal_without_reader, big)
+    assert [h.site for h in hits_small] == [h.site for h in hits_big] == ["app/m0.py:MOVES:done0"]
+    assert cost_big <= 2.5 * cost_small, (cost_small, cost_big)

@@ -3,6 +3,7 @@
 import argparse
 import ast
 import difflib
+import functools
 import io
 import json
 import os
@@ -62,6 +63,12 @@ def _nodes(tree, lazy):
 
 def imported(text, package="", lazy=True):
     """Every dotted name Python source imports (with lazy, inside functions too); relative ones need their package."""
+    return set(_imported(text, package, lazy))
+
+
+@functools.lru_cache(maxsize=4096)
+def _imported(text, package, lazy):
+    # Parsed once per (text, package, lazy): unplaced asks of every test file once per module.
     names = set()
     for n in _nodes(ast.parse(text), lazy):
         if isinstance(n, ast.Import):
@@ -78,7 +85,7 @@ def imported(text, package="", lazy=True):
             if base:
                 names.add(base)
             names.update(f"{base}.{a.name}" if base else a.name for a in n.names if a.name != "*")
-    return names
+    return frozenset(names)
 
 
 def dotted(module, source_root=""):

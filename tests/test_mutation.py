@@ -484,3 +484,22 @@ def test_a_module_the_config_does_not_mutate_is_refused():
     with pytest.raises(SystemExit, match="not mutated"):
         mutation.main(CFG, ["run", "--module", "harness/nope.py"])
 
+
+def test_each_test_file_is_parsed_once_however_many_modules_ask_whether_it_is_placed(tmp_path, monkeypatch):
+    modules = [f"src/pkg/m{i}.py" for i in range(5)]
+    (tmp_path / "tests").mkdir()
+    texts = {f"test_{i}.py": f"import pkg.m{i}\nimport {tmp_path.name}\n" for i in range(4)}
+    for name, text in texts.items():
+        (tmp_path / "tests" / name).write_text(text, encoding="utf-8")
+    cfg = MutationConfig(root=tmp_path, modules={m: [] for m in modules}, pin_file=tmp_path / "p.json",
+                         source_root="src")
+    parsed = []
+    real = mutation.ast.parse
+    monkeypatch.setattr(mutation.ast, "parse", lambda text, *a, **k: parsed.append(text) or real(text, *a, **k))
+    got = [mutation.unplaced(cfg, m) for m in modules]
+    assert got == [["test_0.py"], ["test_1.py"], ["test_2.py"], ["test_3.py"], []]
+    assert sorted(parsed) == sorted(texts.values())
+    found = mutation.imported(texts["test_0.py"])
+    found.add("x")
+    assert "x" not in mutation.imported(texts["test_0.py"])
+
