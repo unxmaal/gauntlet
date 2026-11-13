@@ -2,6 +2,7 @@
 
 import ast
 import collections
+import itertools
 import re
 from collections import namedtuple
 from pathlib import Path
@@ -1103,40 +1104,98 @@ def _found_tables(prod):
                 yield rel, name, line, table, names
 
 
-def _refs(node, state, names):
-    return [n for n in _walk(node) if (isinstance(n, ast.Constant) and n.value == state and isinstance(state, str))
-            or (isinstance(n, ast.Name) and n.id in names) or (isinstance(n, ast.Attribute) and n.attr in names)]
+@_per_node
+def _state_marks(tree):
+    # Each node a state can be named by, keyed by what names it, with the comparisons and attributes it sits in.
+    jstr = {id(v) for n in _walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
+    named, around, texts = collections.defaultdict(list), {}, []
+    stack = [(tree, ())]
+    while stack:
+        n, encl = stack.pop()
+        key = (("c", n.value) if isinstance(n, ast.Constant) and isinstance(n.value, str) else
+               ("n", n.id) if isinstance(n, ast.Name) else ("a", n.attr) if isinstance(n, ast.Attribute) else None)
+        if key:
+            named[key].append(n)
+            if encl:
+                around[id(n)] = encl
+        text = _sql_text(n)
+        if text and text.count("'") > 1:
+            texts.append((n, text))
+        if isinstance(n, ast.match_case):
+            stack.append((n.pattern, encl + (n,)))
+            stack.extend((c, encl) for c in ast.iter_child_nodes(n) if c is not n.pattern)
+        else:
+            inner = encl + (n,) if isinstance(n, (ast.Compare, ast.Attribute)) else encl
+            stack.extend((c, inner) for c in ast.iter_child_nodes(n))
+    return jstr, dict(named), around, texts
+
+
+def _quoted(texts, wanted, longest):
+    # {state: text nodes holding 'state'}, from the quote pairs no further apart than the longest state.
+    out = collections.defaultdict(list)
+    for n, text in texts:
+        quotes = [m.start() for m in re.finditer("'", text)]
+        held = set()
+        for a, i in enumerate(quotes):
+            for j in itertools.islice(quotes, a + 1, None):
+                if j - i - 1 > longest:
+                    break
+                s = text[i + 1:j]
+                if s in wanted and s not in held:
+                    held.add(s)
+                    out[s].append(n)
+    return out
+
+
+def _state_index(prod, wanted):
+    # One pass over the trees: {key: [rel]}, {state: [(rel, text node)]} and each tree's mentions.
+    mentions = {rel: _state_marks(tree) for rel, tree in prod.items()}
+    named, quoted = collections.defaultdict(list), collections.defaultdict(list)
+    longest = max(map(len, wanted), default=-1)
+    for rel, (_, keyed, _, texts) in mentions.items():
+        for key in keyed:
+            named[key].append(rel)
+        for state, nodes in _quoted(texts, wanted, longest).items():
+            quoted[state] += [(rel, n) for n in nodes]
+    return named, quoted, mentions
 
 
 _WHERE = re.compile(r"(?is)\bWHERE\b(.*)$")
 
 
-def _uses(tree, state, names, skip):
-    # (reads, writes): a read compares against the state or filters on it in SQL; any other mention is a write.
-    reads = writes = 0
-    counted = {id(v) for n in _walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
-    for n in _walk(tree):
-        if id(n) in skip or id(n) in counted:
+def _uses(index, state, names, home, skip):
+    # ({rel: reads}, {rel: writes}): a read compares against the state or filters on it in SQL; any other mention
+    # is a write. Only the nodes that name the state are visited.
+    named, quoted, mentions = index
+    keys = [("c", state)] if isinstance(state, str) else []
+    keys += [(kind, x) for x in names for kind in ("n", "a")]
+    hits = [(rel, m) for key in keys for rel in named.get(key, ()) for m in mentions[rel][1][key]]
+    reads, writes = collections.Counter(), collections.Counter()
+    compares, covered, mentioned = set(), set(), {}
+    for rel, m in hits:
+        mentioned[id(m)] = rel, m
+        skipped = skip if rel == home else ()
+        for c in mentions[rel][2].get(id(m), ()):
+            if isinstance(c, ast.Attribute):
+                mentioned[id(c)] = rel, c
+            elif id(c) not in skipped:
+                covered.add(id(m))
+                if id(c) not in compares:
+                    compares.add(id(c))
+                    reads[rel] += 1
+    for rel, n in quoted.get(state, ()):
+        if id(n) in (skip if rel == home else ()) or id(n) in mentions[rel][0]:
             continue
-        if isinstance(n, ast.Compare) or isinstance(n, ast.match_case):
-            got = _refs(n if isinstance(n, ast.Compare) else n.pattern, state, names)
-            if got:
-                reads += 1
-                counted |= {id(g) for g in got}
+        where = _WHERE.search(_sql_text(n))
+        if where and f"'{state}'" in where.group(1):
+            reads[rel] += 1
+        else:
+            writes[rel] += 1
+    for rel, n in mentioned.values():
+        if id(n) in (skip if rel == home else ()) or id(n) in mentions[rel][0] or id(n) in covered:
             continue
-        text = _sql_text(n)
-        if text and isinstance(state, str) and f"'{state}'" in text:
-            where = _WHERE.search(text)
-            if where and f"'{state}'" in where.group(1):
-                reads += 1
-            else:
-                writes += 1
-            counted.add(id(n))
-            continue
-        if isinstance(n, (ast.Constant, ast.Name, ast.Attribute)) and _refs(n, state, names) and id(n) not in counted:
-            if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)):
-                writes += 1
-            counted.add(id(n))
+        if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)):
+            writes[rel] += 1
     return reads, writes
 
 
@@ -1145,21 +1204,18 @@ def terminal_without_reader(trees, production=default_production, tables=None):
     reports a row that reaches it. `tables` are registered MoveTables; without them the declared tables are read."""
     prod = _prod(trees, production)
     found = list(_registered_tables(tables, prod)) if tables else list(_found_tables(prod))
+    terminal = [(row, sorted((s for s, nxt in row[3].items() if not nxt and s is not None), key=str)) for row in found]
+    index = _state_index(prod, {s for _, states in terminal for s in states if isinstance(s, str)}) if found else None
     out = []
-    for rel, name, line, table, names in found:
+    for (rel, name, line, table, names), states in terminal:
         home = prod.get(rel)
         decl = set()
         if home is not None:
             decl = {id(m) for n, v, _ in _assign_targets(home) if n == name or n in set().union(*names.values())
                     for m in _walk(v)}
-        for state in sorted((s for s, nxt in table.items() if not nxt and s is not None), key=str):
-            readers, writers = set(), {rel}
-            for other, tree in prod.items():
-                r, w = _uses(tree, state, names.get(state, set()), decl if other == rel else set())
-                if w:
-                    writers.add(other)
-                if r:
-                    readers.add(other)
+        for state in states:
+            reads, writes = _uses(index, state, names.get(state, set()), rel, decl)
+            readers, writers = {r for r, k in reads.items() if k}, {rel} | {r for r, k in writes.items() if k}
             if not readers - writers:
                 out.append(Hit(f"{rel}:{name}:{state}", line, "no move leaves this state and nothing outside the "
                                "modules that write it reads it: a row that lands here is never settled or reported"))
