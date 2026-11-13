@@ -136,7 +136,7 @@ Each failure message lists every offending site, so one run shows the whole list
 | `undeadlined_wait`, `terminal_without_reader` | a-wait-with-no-deadline-owner-or-end-state | a loop or wait with no deadline, or a terminal state nothing reads |
 | `row_index_keys` | order-assumed-on-unordered-data | a dict keyed on an `enumerate()` index, which pairs rows by list position instead of identity |
 | `latest_row_state` | state-is-whichever-row-came-last | current state read from the newest row of an append-only table |
-| `unguarded_transition` | a-lifecycle-with-no-declared-state | an `UPDATE` that sets a state or status with no `WHERE` on the state it leaves, or one state column written from several modules |
+| `unguarded_transition` | a-lifecycle-with-no-declared-state | an `UPDATE` that sets a state or status (or a configured lifecycle column) with no `WHERE` on the state it leaves, or one state column written from several modules |
 
 Most detectors work with no configuration. The ones that need to know your repo's names (the scope column, the
 migration path, the effect functions) find nothing until `detector_config` tells them; see below. The Terraform
@@ -241,8 +241,12 @@ It also fails on any module constant named `MOVES`, `TRANSITIONS` or `*_MOVES` h
 is the same check as a plain assertion.
 
 A detector that needs repo knowledge takes it from `Registry(detector_config={name: kwargs})`.
-`commit_then_link` finds committing helpers by their `conn.commit()`; name others with
-`{"commit_then_link": {"committers": ("put",)}}`. `terminal_without_reader` gets `Registry.moves` unless
+`commit_then_link` finds committing helpers by their `conn.commit()`, and counts a call only when it resolves to
+one (same module, an imported name or a module attribute). A call through a receiver no import names (a parameter or
+a local object) counts when every definition of that method name commits, and not when the name is ambiguous; name others with
+`{"commit_then_link": {"committers": ("put",)}}`, which match by name. `unguarded_transition` checks the `state` and
+`status` columns; widen that with `{"unguarded_transition": {"columns": ("state", "status", "outcome")}}`. A `WHERE`
+built from an f-string substitution is not reported, since its guard cannot be read. `terminal_without_reader` gets `Registry.moves` unless
 `detector_config` gives it `tables`, and otherwise reads the declared `MOVES` literals. `unscoped_query` finds nothing
 until it is told the scope: `{"unscoped_query": {"columns": ("machine_id",), "tables": ("jobs",), "helpers": ("_here",),
 "null_helper": "app/scope.py:here"}}`; a table whose CREATE TABLE names a scope column is scoped without being listed,

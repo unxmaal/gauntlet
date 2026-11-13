@@ -173,11 +173,11 @@ def _quiet_miss(node, negated, parent):
 _NEWEST = re.compile(r"(?is)\bORDER\s+BY\s+[^;]*?\bDESC\s+LIMIT\s+1\b(?!\s*,|\d)")
 
 
-def _sql_text(node):
+def _sql_text(node, hole=" x "):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.JoinedStr):
-        return "".join(v.value if isinstance(v, ast.Constant) else " x " for v in node.values)
+        return "".join(v.value if isinstance(v, ast.Constant) else hole for v in node.values)
     return None
 
 
@@ -199,30 +199,37 @@ def latest_row_state(trees, production=default_production):
 
 
 _UPDATE = re.compile(r"(?is)\bUPDATE\s+(\w+)\s+SET\b(.*?)(?:\bWHERE\b(.*))?$")
-_STATE_SET = re.compile(r"(?i)(?<![\w.])(?:\w+\.)?(state|status)\s*=(?!=)")
+_HOLE = "_gauntlet_hole_"
 
 
-def _state_writes(tree):
-    # (node, table, column, guarded) for each UPDATE that sets a state or status column.
+def _state_set(columns):
+    names = "|".join(re.escape(c) for c in columns)
+    return re.compile(rf"(?i)(?<![\w.])(?:\w+\.)?({names})\s*=(?!=)")
+
+
+def _state_writes(tree, columns=("state", "status")):
+    # (node, table, column, guarded) for each UPDATE that sets a lifecycle column; a substituted WHERE is unknown.
+    sets = _state_set(columns)
     parts = {id(v) for n in _walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
     for n in _walk(tree):
-        text = _sql_text(n) if id(n) not in parts else None
+        text = _sql_text(n, f" {_HOLE} ") if id(n) not in parts else None
         m = _UPDATE.search(text) if text else None
         if not m:
             continue
+        table = "x" if m.group(1) == _HOLE else m.group(1).lower()
         where = m.group(3) or ""
-        for col in {c.lower() for c in _STATE_SET.findall(m.group(2))}:
-            guarded = re.search(rf"(?i)\b{col}\w*\b", where) is not None
-            yield n, m.group(1).lower(), col, guarded
+        for col in {c.lower() for c in sets.findall(m.group(2))}:
+            guarded = _HOLE in where or re.search(rf"(?i)\b{re.escape(col)}\w*\b", where) is not None
+            yield n, table, col, guarded
 
 
-def unguarded_transition(trees, production=default_production):
+def unguarded_transition(trees, production=default_production, columns=("state", "status")):
     out, writers = [], {}
     for rel, tree in _prod(trees, production).items():
         if "/migrations/" in rel:  # a migration is a one-time rewrite, not a transition
             continue
         owner = _innermost(tree)
-        for n, table, col, guarded in _state_writes(tree):
+        for n, table, col, guarded in _state_writes(tree, columns):
             if table != "x":
                 writers.setdefault(f"{table}.{col}", {}).setdefault(rel, n.lineno)
             if not guarded:
@@ -557,33 +564,101 @@ _DEDUP_SQL = re.compile(r"(?is)\bON\s+CONFLICT\b|\bINSERT\s+OR\s+(?:IGNORE|REPLA
 _DEDUP_KW = {"dedup", "dedupe", "dedup_key", "idempotency_key", "unique_key"}
 
 
-def _committers(prod, extra):
-    names = set(extra)
-    for tree in prod.values():
+def _committers(prod):
+    # short name -> {rel: whether that module's definition commits}.
+    out = {}
+    for rel, tree in prod.items():
         for name, fn in _scopes(tree):
-            if any(isinstance(n, ast.Call) and _call_name(n) == "commit" and not n.args for n in _own(fn)):
-                names.add(name.rsplit(".", 1)[-1])
-    return names
+            commits = any(isinstance(n, ast.Call) and _call_name(n) == "commit" and not n.args for n in _own(fn))
+            homes = out.setdefault(name.rsplit(".", 1)[-1], {})
+            homes[rel] = homes.get(rel, False) or commits
+    return out
+
+
+def _bound(rel, tree, by_name):
+    # local name -> (dotted module, attribute or None) for each import in the module.
+    pkg = rel.split("/")[:-1]
+    out = {}
+    for n in _walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                out[a.asname or a.name.split(".")[0]] = (a.name if a.asname else a.name.split(".")[0], None)
+        elif isinstance(n, ast.ImportFrom):
+            base = n.module or ""
+            if n.level:
+                up = pkg[:len(pkg) - (n.level - 1)] if n.level > 1 else pkg
+                base = ".".join(up + ([base] if base else []))
+            for a in n.names:
+                sub = f"{base}.{a.name}" if base else a.name
+                out[a.asname or a.name] = (sub, None) if sub in by_name else (base, a.name)
+    return out
+
+
+def _dotted_expr(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join([node.id, *reversed(parts)]) if isinstance(node, ast.Name) else None
+
+
+def _resolves_to_committer(rel, bound, by_name, defs, extra):
+    # Whether a callee names a committing definition: same module, an imported name, or a module's attribute.
+    def committing(f):
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        if name is None:
+            return False
+        if name in extra:
+            return True
+        if isinstance(f, ast.Name):
+            if rel in defs.get(name, {}):
+                return defs[name][rel]
+            mod, attr = bound.get(name, (None, None))
+            return attr is not None and any(defs.get(attr, {}).get(r) for r in by_name.get(mod, ()))
+        homes = defs.get(name, {})
+        if isinstance(f.value, ast.Name) and f.value.id in ("self", "cls"):
+            return homes.get(rel, False)
+        recv = _dotted_expr(f.value)
+        head, _, rest = (recv or "").partition(".")
+        mod, attr = bound.get(head, (None, None))
+        if mod is None:  # a receiver no import names: count the name only if every definition of it commits
+            return bool(homes) and all(homes.values())
+        full = ".".join(p for p in (mod, attr, rest) if p)
+        while full and full not in by_name:
+            full = full.rpartition(".")[0]
+        return any(homes.get(r) for r in by_name.get(full, ()))
+    return committing
 
 
 def commit_then_link(trees, production=default_production, committers=()):
     """A helper that commits, whose returned id is then written by a second write: a death between leaves one."""
     prod = _prod(trees, production)
-    known = _committers(prod, committers)
+    defs = _committers(prod)
+    by_name = {}
+    for rel in prod:
+        for d in _dotted(rel):
+            by_name.setdefault(d, set()).add(rel)
+    extra = set(committers)
     out = []
     for rel, tree in prod.items():
+        resolves = _resolves_to_committer(rel, _bound(rel, tree, by_name), by_name, defs, extra)
         for name, fn in _bodies(tree):
             short = name.rsplit(".", 1)[-1]
             nodes = _own(fn)
-            local = set(known) - {short}
+            aliases = set()
+
+            def committing(f, aliases=aliases, short=short, resolves=resolves):
+                if isinstance(f, ast.Name) and f.id in aliases:
+                    return True
+                got = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+                return got != short and resolves(f)
             for n in nodes:
                 if isinstance(n, ast.Assign) and not isinstance(n.value, ast.Call) and any(
-                        isinstance(r, (ast.Name, ast.Attribute)) and (getattr(r, "id", None) or r.attr) in local
-                        for r in _walk(n.value)):
-                    local |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+                        isinstance(r, (ast.Name, ast.Attribute)) and committing(r) for r in _walk(n.value)):
+                    aliases |= {t.id for t in n.targets if isinstance(t, ast.Name)}
 
             def commits(call):
-                if not (isinstance(call, ast.Call) and _call_name(call) in local):
+                if not (isinstance(call, ast.Call) and committing(call.func)):
                     return False
                 deferred = _kw(call, "commit")
                 return not (deferred is not None and _false(deferred)) and not any(
