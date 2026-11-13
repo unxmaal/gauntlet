@@ -1,5 +1,6 @@
 """The ratchets a consumer's test suite runs over its registry; tests(reg) returns them as pytest test functions."""
 
+import collections
 import re
 import warnings
 
@@ -86,13 +87,32 @@ def unbound(reg, led):
             for cid, s in new]
 
 
+def _same_site(row):
+    cid, site = row
+    return cid, site.partition(":")[2]
+
+
+def _moves(added, removed):
+    # {added row: removed row} where the two share a class and a site minus its path, and nothing else does.
+    gained = collections.Counter(map(_same_site, added))
+    lost = {}
+    for row in removed:
+        lost.setdefault(_same_site(row), []).append(row)
+    return {row: lost[_same_site(row)][0] for row in added
+            if gained[_same_site(row)] == 1 and len(lost.get(_same_site(row), ())) == 1}
+
+
 def backlog_problems(reg, led):
     if reg.backlog_pin is not None:
         warnings.warn("backlog_pin is ignored: the backlog is checked against its merge base with backlog_base",
                       DeprecationWarning, stacklevel=2)
     backlog = reg.backlog()
-    out = [f"{cid}: {s} is bound, waived or gone: remove it from the backlog" for cid, rows in backlog.items()
-           for s in rows if s not in led.get(cid, {}).get("unbound", [])]
+    gone = {(cid, s) for cid, rows in backlog.items() for s in rows if s not in led.get(cid, {}).get("unbound", [])}
+    fresh = {(cid, s) for cid, row in led.items() for s in row.get("unbound", []) if s not in backlog.get(cid, [])}
+    went = _moves(fresh, gone)
+    to = {old: new for new, old in went.items()}
+    out = [f"{cid}: {s} moved to {to[cid, s][1]}: update its backlog line to the new path" if (cid, s) in to
+           else f"{cid}: {s} is bound, waived or gone: remove it from the backlog" for cid, s in sorted(gone)]
     rows = {(cid, s) for cid, sites in backlog.items() for s in sites}
     if not rows:
         return out
@@ -103,8 +123,12 @@ def backlog_problems(reg, led):
     if base is None:
         return out
     had = {(cid, s) for cid, sites in base.items() for s in sites}
+    moved = _moves(rows - had, had - rows)
+    for (cid, s), (_, old) in sorted(moved.items()):
+        warnings.warn(f"{cid}: {old} moved to {s} since {reg.backlog_base}: keep its backlog line at the new path",
+                      stacklevel=2)
     return out + [f"{cid}: {s} joined the backlog since {reg.backlog_base}: bind it or waive it instead"
-                  for cid, s in sorted(rows - had)]
+                  for cid, s in sorted(rows - had) if (cid, s) not in moved]
 
 
 def stale(reg, led, marks):

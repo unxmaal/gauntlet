@@ -511,6 +511,26 @@ def test_a_marker_with_a_pid_or_several_lifters_or_an_atomic_rename_is_left_alon
     quiet_then_fires(detectors.orphanable_child, innocent, bad)
 
 
+def _marker(move):
+    return {"app/atomic_file.py": "import os\ndef replace(src, dst):\n    os.replace(src, dst)\n",
+            "app/m.py": ("import os\nfrom app import atomic_file\n"
+                         "def hold(d):\n    (d / \"held\").write_text(\"x\")\n" + move +
+                         "def drop(d):\n    (d / \"held\").unlink()\n")}
+
+
+def test_a_marker_moved_through_a_module_or_a_configured_writer_is_left_alone():
+    for move in ("    os.replace(d / \"held\", d / \"done\")\n", "    atomic_file.replace(d / \"held\", d / \"done\")\n"):
+        assert sites(detectors.orphanable_child, _marker(move)) == []
+    swap = _marker("    atomic_file.swap(d / \"held\", d / \"done\")\n")
+    assert sites(detectors.orphanable_child, swap) == ["app/m.py:held"]
+    assert detectors.orphanable_child(detectors.parse(swap), writers=("app.atomic_file:swap",)) == []
+
+
+def test_a_str_replace_on_a_name_like_the_marker_does_not_hide_it():
+    got = sites(detectors.orphanable_child, _marker("    held = \"held\"\n    held.replace(\"h\", \"H\")\n"))
+    assert got == ["app/m.py:held"]
+
+
 def test_a_wait_with_no_deadline_or_cap_is_found():
     bad = {"app/w.py": ("import time\n"
                         "def quiesce(is_running):\n    while is_running():\n        time.sleep(5)\n"
@@ -714,6 +734,69 @@ def test_a_stamped_cache_a_locked_json_cache_and_an_unpersisted_cache_are_left_a
                          "def save(d):\n    with open(\"c.json.tmp\", \"w\") as f:\n        json.dump(d, f)\n"
                          "    os.replace(\"c.json.tmp\", \"c.json\")\n")}
     assert sites(detectors.uncached_key, {**innocent, **torn}) == ["app/o.py:save"]
+
+
+_PATHS = {"app/paths.py": "from pathlib import Path\nSTATE = Path(\"state.json\")\n"}
+_READER = {"app/r.py": "import json\nfrom app import paths\ndef load():\n    return json.loads(paths.STATE.read_text())\n"}
+
+
+def test_a_json_writer_and_reader_in_two_modules_sharing_a_path_constant_are_found():
+    writer = {"app/w.py": ("import json\nfrom app.paths import STATE\n"
+                           "def save(d):\n    STATE.write_text(json.dumps(d))\n")}
+    assert sites(detectors.uncached_key, {**_PATHS, **_READER, **writer}) == ["app/w.py:save"]
+    same = {"app/v.py": ("import json\nfrom pathlib import Path\n"
+                         "def save(d):\n    Path(\"cache.json\").write_text(json.dumps(d))\n"),
+            "app/u.py": ("import json\nfrom pathlib import Path\n"
+                         "def load():\n    return json.loads(Path(\"cache.json\").read_text())\n")}
+    assert sites(detectors.uncached_key, same) == ["app/v.py:save"]
+
+
+def test_a_locked_cross_module_pair_and_unrelated_local_paths_are_left_alone():
+    innocent = {**_PATHS, **_READER,
+                "app/w.py": ("import json\nfrom filelock import FileLock\nfrom app.paths import STATE\n"
+                             "def save(d):\n    with FileLock(\"state.lock\"):\n"
+                             "        STATE.write_text(json.dumps(d))\n"),
+                "app/a.py": "import json\ndef keep(path, d):\n    path.write_text(json.dumps(d))\n",
+                "app/b.py": "import json\ndef get(path):\n    return json.loads(path.read_text())\n"}
+    bad = {"app/x.py": ("import json\nfrom app import paths\n"
+                        "def bump(d):\n    paths.STATE.write_text(json.dumps(d))\n")}
+    quiet_then_fires(detectors.uncached_key, innocent, bad)
+    assert sites(detectors.uncached_key, {**innocent, **bad}) == ["app/x.py:bump"]
+
+
+_ATOMIC = {"app/atomic_file.py": ("import os, time\n"
+                                  "def replace(src, dst):\n    for _ in range(3):\n        try:\n"
+                                  "            return os.replace(src, dst)\n        except PermissionError:\n"
+                                  "            time.sleep(0.1)\n"
+                                  "def swap(src, dst):\n    return replace(src, dst)\n")}
+
+
+def _store(move, head="from app import atomic_file\n"):
+    return {"app/store.py": ("import json\nfrom pathlib import Path\n" + head + "STATE = Path(\"state.json\")\n"
+                             "def load():\n    return json.loads(STATE.read_text())\n"
+                             "def save(d):\n    tmp = STATE.with_suffix(\".tmp\")\n"
+                             "    tmp.write_text(json.dumps(d))\n" + move)}
+
+
+def test_a_replace_through_a_module_qualified_wrapper_is_followed():
+    got = sites(detectors.uncached_key, {**_ATOMIC, **_store("    atomic_file.replace(tmp, STATE)\n")})
+    assert got == ["app/store.py:save"]
+
+
+def test_a_configured_writer_is_followed_through_its_module_or_an_imported_name():
+    via_module = {**_ATOMIC, **_store("    atomic_file.swap(tmp, STATE)\n")}
+    via_name = {**_ATOMIC, **_store("    move(tmp, STATE)\n", "from app.atomic_file import swap as move\n")}
+    for files in (via_module, via_name):
+        assert sites(detectors.uncached_key, files) == []
+        got = detectors.uncached_key(detectors.parse(files), writers=("app.atomic_file:swap",))
+        assert sorted(h.site for h in got) == ["app/store.py:save"]
+    other = detectors.uncached_key(detectors.parse(via_module), writers=("app.other:swap",))
+    assert other == []
+
+
+def test_a_two_argument_str_replace_is_not_a_move():
+    for move in ("    name = str(tmp)\n    name.replace(tmp, STATE)\n", "    \"state\".replace(tmp, STATE)\n"):
+        assert sites(detectors.uncached_key, {**_ATOMIC, **_store(move)}) == []
 
 
 _PROSE = ("note", "detail", "reason", "why", "outcome", "evidence")

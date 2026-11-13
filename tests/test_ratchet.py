@@ -215,6 +215,64 @@ def test_a_json_backlog_at_the_base_holds_a_txt_backlog_on_the_branch(consumer):
     assert _failing(reg, skill_dir) == []
 
 
+def _move(root, name, to):
+    (root / "app" / f"{name.lower()}.py").rename(root / "app" / f"{to}.py")
+    rows = (root / "backlog.txt").read_text(encoding="utf-8")
+    (root / "backlog.txt").write_text(rows.replace(f"app/{name.lower()}.py:{name}", f"app/{to}.py:{name}"),
+                                      encoding="utf-8")
+
+
+def test_a_site_that_moved_files_passes_and_says_so(three_rows):
+    reg, skill_dir = three_rows
+    _move(reg.root, "ALPHA", "split")
+    with pytest.warns(UserWarning, match="app/alpha.py:ALPHA moved to app/split.py:ALPHA"):
+        assert _backlog(reg) == []
+    with pytest.warns(UserWarning):
+        assert _failing(reg, skill_dir) == []
+
+
+def test_a_move_beside_a_new_row_fails_only_on_the_new_row(three_rows):
+    reg, _ = three_rows
+    _move(reg.root, "ALPHA", "split")
+    (reg.root / "app" / "delta.py").write_text(_table("DELTA"), encoding="utf-8")
+    (reg.root / "backlog.txt").write_text((reg.root / "backlog.txt").read_text(encoding="utf-8") + _rows("DELTA"),
+                                          encoding="utf-8")
+    with pytest.warns(UserWarning, match="moved to app/split.py:ALPHA"):
+        assert _backlog(reg) == [
+            f"{CLOSED}: app/delta.py:DELTA joined the backlog since origin/main: bind it or waive it instead"]
+
+
+def test_a_moved_row_with_two_candidates_on_either_side_fails(consumer):
+    reg, _ = consumer
+    for rel in ("one", "two"):
+        (reg.root / "app" / f"{rel}.py").write_text(_table("ECHO"), encoding="utf-8")
+    (reg.root / "backlog.txt").write_text(f"{CLOSED} app/one.py:ECHO\n{CLOSED} app/two.py:ECHO\n", encoding="utf-8")
+    _publish(reg.root)
+    for rel in ("one", "two"):
+        (reg.root / "app" / f"{rel}.py").unlink()
+    (reg.root / "app" / "three.py").write_text(_table("ECHO"), encoding="utf-8")
+    (reg.root / "backlog.txt").write_text(f"{CLOSED} app/three.py:ECHO\n", encoding="utf-8")
+    assert _backlog(reg) == [
+        f"{CLOSED}: app/three.py:ECHO joined the backlog since origin/main: bind it or waive it instead"]
+    (reg.root / "app" / "four.py").write_text(_table("ECHO"), encoding="utf-8")
+    (reg.root / "app" / "one.py").write_text(_table("ECHO"), encoding="utf-8")
+    (reg.root / "backlog.txt").write_text(f"{CLOSED} app/four.py:ECHO\n{CLOSED} app/one.py:ECHO\n"
+                                          f"{CLOSED} app/three.py:ECHO\n", encoding="utf-8")
+    assert _backlog(reg) == [
+        f"{CLOSED}: app/four.py:ECHO joined the backlog since origin/main: bind it or waive it instead",
+        f"{CLOSED}: app/three.py:ECHO joined the backlog since origin/main: bind it or waive it instead"]
+
+
+def test_a_site_that_moved_under_a_backlog_line_left_behind_names_the_new_path(three_rows):
+    reg, _ = three_rows
+    (reg.root / "app" / "alpha.py").rename(reg.root / "app" / "split.py")
+    assert _backlog(reg) == [
+        f"{CLOSED}: app/alpha.py:ALPHA moved to app/split.py:ALPHA: update its backlog line to the new path"]
+    (reg.root / "app" / "other.py").write_text(_table("ALPHA"), encoding="utf-8")
+    assert _backlog(reg) == [
+        f"{CLOSED}: app/alpha.py:ALPHA is bound, waived or gone: remove it from the backlog"]
+
+
 def test_a_json_and_a_txt_backlog_load_the_same_rows(tmp_path):
     want = {CLOSED: ["app/a.py:A", "app/b.py:B"], "other-class": ["app/c.py:has a space"]}
     (tmp_path / "backlog.json").write_text(json.dumps(want), encoding="utf-8")
