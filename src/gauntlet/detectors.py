@@ -612,14 +612,19 @@ def _module_names(prod):
     return by_name
 
 
-def _module_of(dotted, bound, by_name):
-    # The module a dotted receiver names through this file's imports, or None when it names something else.
+def _receiver(dotted, bound):
+    # (dotted path a receiver names through this file's imports, whether it is a bare module import), or (None, False).
     head, _, rest = (dotted or "").partition(".")
     mod, attr = bound.get(head, (None, None))
     if mod is None:
-        return None
-    full = ".".join(p for p in (mod, attr, rest) if p)
-    return full if (attr is None and not rest) or full in by_name else None
+        return None, False
+    return ".".join(p for p in (mod, attr, rest) if p), attr is None and not rest
+
+
+def _module_of(dotted, bound, by_name):
+    # The module a dotted receiver names through this file's imports, or None when it names something else.
+    full, plain = _receiver(dotted, bound)
+    return full if full is not None and (plain or full in by_name) else None
 
 
 def _same_module(a, b, by_name):
@@ -663,64 +668,131 @@ def _plain_os(v):
     return ast.unparse(v) == "os"
 
 
-def _resolves_to_committer(rel, bound, by_name, defs, extra):
-    # Whether a callee names a committing definition: same module, an imported name, or a module's attribute.
-    def committing(f):
+_REEXPORT_DEPTH = 4
+_HELPER_DEPTH = 2
+
+
+class _Calls:
+    # Resolves a callee to the (rel, short name) definitions it reaches, through imports and package re-exports.
+    def __init__(self, prod):
+        self.defs = _committers(prod)
+        self.fns = {}
+        for rel, tree in prod.items():
+            for name, fn in _scopes(tree):
+                self.fns.setdefault((rel, name.rsplit(".", 1)[-1]), []).append(fn)
+        self.by_name = _module_names(prod)
+        self.bounds = {rel: _bound(rel, tree, self.by_name) for rel, tree in prod.items()}
+
+    def reach(self, rels, name, depth=_REEXPORT_DEPTH, seen=frozenset()):
+        out = set()
+        for r in rels:
+            if r in self.defs.get(name, {}):
+                out.add((r, name))
+                continue
+            mod, attr = self.bounds[r].get(name, (None, None))
+            if attr is not None and depth > 0 and (r, name) not in seen:
+                out |= self.reach(self.by_name.get(mod, ()), attr, depth - 1, seen | {(r, name)})
+        return out
+
+    def resolve(self, rel, f):
+        # (keys, every): a resolved call reaches any of keys; an unresolved receiver may be every one of them.
         name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
         if name is None:
-            return False
-        if name in extra:
-            return True
+            return set(), False
+        homes, bound = self.defs.get(name, {}), self.bounds[rel]
         if isinstance(f, ast.Name):
-            if rel in defs.get(name, {}):
-                return defs[name][rel]
+            if rel in homes:
+                return {(rel, name)}, False
             mod, attr = bound.get(name, (None, None))
-            return attr is not None and any(defs.get(attr, {}).get(r) for r in by_name.get(mod, ()))
-        homes = defs.get(name, {})
+            return (self.reach(self.by_name.get(mod, ()), attr) if attr is not None else set()), False
         if isinstance(f.value, ast.Name) and f.value.id in ("self", "cls"):
-            return homes.get(rel, False)
-        recv = _dotted_expr(f.value)
-        head, _, rest = (recv or "").partition(".")
-        mod, attr = bound.get(head, (None, None))
-        if mod is None:  # a receiver no import names: count the name only if every definition of it commits
-            return bool(homes) and all(homes.values())
-        full = ".".join(p for p in (mod, attr, rest) if p)
-        while full and full not in by_name:
+            return ({(rel, name)} if rel in homes else set()), False
+        full, _ = _receiver(_dotted_expr(f.value), bound)
+        if full is None:
+            return {(r, name) for r in homes}, True
+        while full and full not in self.by_name:
             full = full.rpartition(".")[0]
-        return any(homes.get(r) for r in by_name.get(full, ()))
-    return committing
+        return self.reach(self.by_name.get(full, ()), name), False
+
+    def holds(self, rel, f, pred, resolved=False):
+        keys, every = self.resolve(rel, f)
+        if every and resolved:
+            return False
+        return bool(keys) and (all if every else any)(pred(k) for k in keys)
+
+    def targets(self, entry):
+        # `pkg.mod:name` or `pkg/mod.py:name` -> the definitions it names, re-exports followed.
+        where, _, name = entry.rpartition(":")
+        name = name.rsplit(".", 1)[-1]
+        if where.endswith(".py"):
+            rels = {r for r in self.bounds if r == where or r.endswith("/" + where)}
+        else:
+            rels = self.by_name.get(where, set())
+        got = self.reach(rels, name)
+        if not got:
+            raise ValueError(f"commit_then_link committer {entry!r} names no definition in production code")
+        return got
+
+
+def _write_call(n):
+    sql = _sql_text(n.args[0]) if n.args else None
+    return (_call_name(n) in ("execute", "executemany") and bool(sql) and bool(_LINK_SQL.search(sql))
+            and not _DEDUP_SQL.search(sql))
 
 
 def commit_then_link(trees, production=default_production, committers=()):
     """A helper that commits, whose returned id is then written by a second write: a death between leaves one."""
     prod = _prod(trees, production)
-    defs = _committers(prod)
-    by_name = _module_names(prod)
-    extra = set(committers)
+    calls = _Calls(prod)
+    extra = {c for c in committers if ":" not in c}
+    named = set().union(*(calls.targets(c) for c in committers if ":" in c))
+
+    def resolves(rel, f):
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        if name is None:
+            return False
+        if name in extra:
+            return True
+        return calls.holds(rel, f, lambda k: k in named or calls.defs[k[1]][k[0]])
+
+    def deferred(call):
+        flag = _kw(call, "commit")
+        return (flag is not None and _false(flag)) or any(k.arg in _DEDUP_KW for k in call.keywords)
+
+    memo = {}
+
+    def writes(key, depth):
+        # A helper writes when its body runs INSERT/UPDATE SQL or a committing call, or calls one that does.
+        if (key, depth) in memo:
+            return memo[key, depth]
+        memo[key, depth] = False
+        rel = key[0]
+        found = any(
+            _write_call(n) or (not deferred(n) and resolves(rel, n.func))
+            or (depth > 0 and calls.holds(rel, n.func, lambda k: writes(k, depth - 1), resolved=True))
+            for fn in calls.fns.get(key, ()) for n in _own(fn) if isinstance(n, ast.Call))
+        memo[key, depth] = found
+        return found
+
     out = []
     for rel, tree in prod.items():
-        resolves = _resolves_to_committer(rel, _bound(rel, tree, by_name), by_name, defs, extra)
         for name, fn in _bodies(tree):
             short = name.rsplit(".", 1)[-1]
             nodes = _own(fn)
             aliases = set()
 
-            def committing(f, aliases=aliases, short=short, resolves=resolves):
+            def committing(f, aliases=aliases, short=short, rel=rel):
                 if isinstance(f, ast.Name) and f.id in aliases:
                     return True
                 got = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
-                return got != short and resolves(f)
+                return got != short and resolves(rel, f)
             for n in nodes:
                 if isinstance(n, ast.Assign) and not isinstance(n.value, ast.Call) and any(
                         isinstance(r, (ast.Name, ast.Attribute)) and committing(r) for r in _walk(n.value)):
                     aliases |= {t.id for t in n.targets if isinstance(t, ast.Name)}
 
             def commits(call):
-                if not (isinstance(call, ast.Call) and committing(call.func)):
-                    return False
-                deferred = _kw(call, "commit")
-                return not (deferred is not None and _false(deferred)) and not any(
-                    k.arg in _DEDUP_KW for k in call.keywords)
+                return isinstance(call, ast.Call) and committing(call.func) and not deferred(call)
             tainted, first = set(), None
             for n in nodes:
                 value = n.value if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else None
@@ -738,11 +810,12 @@ def commit_then_link(trees, production=default_production, committers=()):
             for n in nodes:
                 if not isinstance(n, ast.Call) or n.lineno < first:
                     continue
-                rest = [a for a in n.args[1:]] + [k.value for k in n.keywords]
-                sql = _sql_text(n.args[0]) if n.args else None
-                link = (_call_name(n) in ("execute", "executemany") and sql and _LINK_SQL.search(sql)
-                        and not _DEDUP_SQL.search(sql) and any(tainted & _names(a) for a in rest))
-                link = link or (commits(n) and any(tainted & _names(a) for a in n.args + [k.value for k in n.keywords]))
+                args = n.args + [k.value for k in n.keywords]
+                passed = any(tainted & _names(a) for a in args)
+                link = _write_call(n) and any(tainted & _names(a) for a in args[1:])
+                link = link or (commits(n) and passed)
+                link = link or (passed and _call_name(n) not in ("execute", "executemany")
+                                and calls.holds(rel, n.func, lambda k: writes(k, _HELPER_DEPTH), resolved=True))
                 if link:
                     out.append(Hit(f"{rel}:{name}", n.lineno, "a committed id written by a second, separate write; "
                                    "a death between the two leaves the first with nothing pointing at it"))
