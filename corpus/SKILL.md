@@ -702,9 +702,12 @@ only by one function that refuses an illegal move? Or is it inferred from which
 columns are null, which flags are set, whether a file or process exists, or
 which row is newest, and written from several places?
 
-**Tier:** 2, with a tier-1 detector for the scannable half: an `UPDATE ... SET
-state =` whose WHERE does not also name the state it leaves, and a state column
-written from more than one module.
+**Tier:** 2, with detectors for the scannable half. `unguarded_transition`: an
+`UPDATE ... SET state =` whose WHERE does not also name the state it leaves, an
+`obj.state = X` with no check of the state it leaves, and a state column or
+attribute written from more than one module. `inferred_stage`: an entity with no
+state field whose timestamp or flag fields are written at separate sites and
+read together in one condition.
 
 **Test shape:** list the states and the legal moves as a table in one module.
 Assert every write goes through it, that an illegal move is refused, and that a

@@ -225,9 +225,13 @@ def _state_writes(tree, columns=("state", "status")):
             yield n, table, col, guarded
 
 
-def unguarded_transition(trees, production=default_production, columns=("state", "status")):
-    out, writers = [], {}
-    for rel, tree in _prod(trees, production).items():
+def unguarded_transition(trees, production=default_production, columns=("state", "status"), movers=()):
+    prod = _prod(trees, production)
+    out, writers, attrs = [], {}, {}
+    classes = _class_index(prod)
+    cols = {c.lower() for c in columns}
+    compared = _compared_attrs(prod) & cols
+    for rel, tree in prod.items():
         if "/migrations/" in rel:  # a migration is a one-time rewrite, not a transition
             continue
         owner = _innermost(tree)
@@ -237,11 +241,296 @@ def unguarded_transition(trees, production=default_production, columns=("state",
             if not guarded:
                 out.append(Hit(f"{rel}:{owner.get(id(n), '<module>')}", n.lineno,
                                f"sets {table}.{col} with no WHERE on the {col} it leaves"))
+        for name, fn in _scopes(tree):
+            for target, stmt, guarded, entity in _attr_state_writes(rel, name, fn, compared, classes, movers):
+                if entity:
+                    attrs.setdefault(f"{entity}.{target.attr}", {}).setdefault(rel, stmt.lineno)
+                if not guarded:
+                    out.append(Hit(f"{rel}:{name}", stmt.lineno, f"sets .{target.attr} with no check of the "
+                                   f"{target.attr} it leaves"))
     for key, mods in writers.items():
         if len(mods) > 1:
             rel, line = min(mods.items())
             out.append(Hit(f"table:{key}", line, f"{key} written from {len(mods)} modules: {', '.join(sorted(mods))}"))
+    for key, mods in attrs.items():
+        if len(mods) > 1:
+            rel, line = min(mods.items())
+            out.append(Hit(key, line, f"{key.partition(':')[2]} written from {len(mods)} modules: "
+                           f"{', '.join(sorted(mods))}"))
     return out
+
+
+_CONSTRUCT = ("__init__", "__post_init__", "__new__", "__setstate__")
+
+
+def _class_index(prod):
+    # {class name: [(rel, node)]} and {attribute: {(rel, class)}} for the attributes each class declares.
+    by_name, declares = {}, {}
+    for rel, tree in prod.items():
+        for c in _walk(tree):
+            if not isinstance(c, ast.ClassDef):
+                continue
+            by_name.setdefault(c.name, []).append((rel, c))
+            for stmt in c.body:
+                t = stmt.target if isinstance(stmt, ast.AnnAssign) else (
+                    stmt.targets[0] if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 else None)
+                if isinstance(t, ast.Name):
+                    declares.setdefault(t.id, set()).add((rel, c.name))
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for n in _own(stmt):
+                        if (isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)
+                                and isinstance(n.value, ast.Name) and n.value.id == "self"):
+                            declares.setdefault(n.attr, set()).add((rel, c.name))
+    return by_name, declares
+
+
+def _compared_attrs(prod):
+    # Attribute names some production code branches on: a comparison or a match subject.
+    out = set()
+    for tree in prod.values():
+        for n in _walk(tree):
+            parts = _compared(n.left, *n.comparators) if isinstance(n, ast.Compare) else (
+                _compared(n.subject) if isinstance(n, ast.Match) else [])
+            out.update(p.attr.lower() for p in parts if isinstance(p, ast.Attribute))
+    return out
+
+
+def _compared(*parts):
+    return [e for p in parts for e in (p.elts if isinstance(p, ast.Tuple) else (p,))]
+
+
+def _state_value(value):
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, str)
+    if isinstance(value, ast.Attribute):
+        return _upper(value.attr) or isinstance(value.value, ast.Name) and value.value.id[:1].isupper()
+    return isinstance(value, ast.Name) and _upper(value.id)
+
+
+def _receiver_class(recv, rel, qualname, fn, classes, attr=None):
+    # The (rel, class) a receiver names: self in a method, an annotated parameter, a local built by a constructor,
+    # else the one class that declares the attribute.
+    by_name, declares = classes
+    if not isinstance(recv, ast.Name):
+        return None
+    if recv.id == "self" and "." in qualname:
+        kind = qualname.rsplit(".", 2)[-2]
+    else:
+        kind = _local_kinds(fn).get(recv.id) if fn is not None else None
+    if kind is None:
+        homes = declares.get(attr, set())
+        return min(homes) if len(homes) == 1 else None
+    homes = by_name.get(kind, [])
+    if len(homes) == 1:
+        return homes[0][0], kind
+    same = [h for h in homes if h[0] == rel]
+    return (rel, kind) if len(same) == 1 else None
+
+
+@_per_node
+def _local_kinds(fn):
+    # {name: class name} from a parameter's annotation or a capitalised constructor call assigned to the name.
+    out = {}
+    for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
+        ann = a.annotation
+        ann = ann.value if isinstance(ann, ast.Constant) and isinstance(ann.value, str) else (
+            ann.id if isinstance(ann, ast.Name) else ann.attr if isinstance(ann, ast.Attribute) else None)
+        if ann and re.fullmatch(r"[A-Z]\w*", ann):
+            out[a.arg] = ann
+    for n in _own(fn):
+        name = _call_name(n.value) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) else None
+        if name and name[:1].isupper():
+            out.update((t.id, name) for t in n.targets if isinstance(t, ast.Name))
+    return out
+
+
+def _built_here(fn):
+    return {t.id for n in _own(fn) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+            and (_call_name(n.value) or "")[:1].isupper() for t in n.targets if isinstance(t, ast.Name)}
+
+
+def _names_moves(fn):
+    return any((isinstance(n, ast.Name) and _MOVE_NAME.fullmatch(n.id))
+               or (isinstance(n, ast.Attribute) and _MOVE_NAME.fullmatch(n.attr)) for n in _own(fn))
+
+
+def _attr_state_writes(rel, qualname, fn, cols, classes, movers):
+    # (target, stmt, guarded, "rel:Class" or None) for each `<expr>.<col> = <state>` in fn's own body.
+    short = qualname.rsplit(".", 1)[-1]
+    if short in _CONSTRUCT or not cols:
+        return
+    exempt = short in movers or qualname in movers or _names_moves(fn)
+    built, body = _built_here(fn), _own(fn)
+    for i, stmt in enumerate(body):
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is None:
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        for t in targets:
+            if not (isinstance(t, ast.Attribute) and t.attr.lower() in cols and _state_value(stmt.value)):
+                continue
+            if isinstance(t.value, ast.Name) and t.value.id in built:
+                continue
+            want = (t.attr, ast.dump(t.value))
+
+            def same(x):
+                return isinstance(x, ast.Attribute) and (x.attr, ast.dump(x.value)) == want
+            guarded = exempt or any(
+                (isinstance(n, ast.Compare) and any(same(p) for p in _compared(n.left, *n.comparators)))
+                or (isinstance(n, ast.Match) and any(same(p) for p in _compared(n.subject))) for n in body[:i])
+            home = _receiver_class(t.value, rel, qualname, fn, classes, t.attr)
+            yield t, stmt, guarded, f"{home[0]}:{home[1]}" if home else None
+
+
+_MARKERS = ("_at", "done", "complete", "completed", "finished", "cancelled", "canceled", "removed", "started",
+            "failed", "archived")
+_NOT_STAGES = ("created_at", "updated_at", "modified_at", "inserted_at")
+_INSERT = re.compile(r"(?is)\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)\s*\(([^)]*)\)")
+_SET_COL = re.compile(r"(?<![\w.])(?:\w+\.)?(\w+)\s*=(?!=)")
+_NULL_TEST = re.compile(r"(?i)(?<![\w.])(?:\w+\.)?(\w+)\s+IS\s+(?:NOT\s+)?NULL\b")
+_TABLE_REF = re.compile(r"(?i)\b(?:FROM|JOIN|UPDATE|INTO)\s+(\w+)")
+
+
+def _marker_test(markers, ignore):
+    suffixes = tuple(m for m in markers if m.startswith("_"))
+    exact = {m for m in markers if not m.startswith("_")}
+    ignore = set(ignore)
+
+    def test(name):
+        name = name.lower()
+        if name in ignore:
+            return False
+        bare = name[3:] if name.startswith("is_") else name
+        return bare in exact or name in exact or name.endswith(suffixes)
+    return test
+
+
+def _sql_entities(prod, is_marker, declared):
+    # {table: {"sites": [frozenset(markers)], "line": (rel, line), "state": bool, "reads": [(rel, line, markers)]}}
+    out = {}
+    for rel, tree in prod.items():
+        if "/migrations/" in rel:
+            continue
+        parts = {id(v) for n in _walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values}
+        for n in _walk(tree):
+            text = _sql_text(n, f" {_HOLE} ") if id(n) not in parts else None
+            if not text:
+                continue
+            m, ins = _UPDATE.search(text), _INSERT.search(text)
+            table, cols = None, []
+            if m and m.group(1) != _HOLE:
+                table, cols = m.group(1).lower(), _SET_COL.findall(m.group(2))
+            elif ins and ins.group(1) != _HOLE:
+                table, cols = ins.group(1).lower(), [c.strip().split(".")[-1] for c in ins.group(2).split(",")]
+            if table:
+                e = out.setdefault(table, {"sites": [], "line": (rel, n.lineno), "state": False, "reads": []})
+                e["state"] |= any(c.lower() in declared for c in cols)
+                got = frozenset(c.lower() for c in cols if is_marker(c))
+                if got:
+                    e["sites"].append(got)
+            where = re.search(r"(?is)\bWHERE\b(.*)$", text)
+            if where:
+                tested = {c.lower() for c in _NULL_TEST.findall(where.group(1)) if is_marker(c)}
+                if len(tested) > 1:
+                    for t in {t.lower() for t in _TABLE_REF.findall(text) if t != _HOLE}:
+                        out.setdefault(t, {"sites": [], "line": (rel, n.lineno), "state": False, "reads": []})
+                        out[t]["reads"].append((rel, n.lineno, frozenset(tested)))
+    return out
+
+
+def _bool_reads(tree, is_marker):
+    # (node, receiver dump, {markers}) for each and/or that tests two marker fields of one receiver.
+    for n in _walk(tree):
+        if not isinstance(n, ast.BoolOp):
+            continue
+        by = {}
+        for x in _walk(n):
+            name = None
+            if isinstance(x, ast.Attribute) and isinstance(x.ctx, ast.Load):
+                name, recv, keyed = x.attr, x.value, False
+            elif isinstance(x, ast.Subscript) and _str(x.slice) is not None:
+                name, recv, keyed = _str(x.slice), x.value, True
+            elif (isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "get"
+                  and x.args and _str(x.args[0]) is not None):
+                name, recv, keyed = _str(x.args[0]), x.func.value, True
+            if name and is_marker(name):
+                by.setdefault((keyed, ast.dump(recv)), (recv, set()))[1].add(name.lower())
+        for (keyed, _), (recv, names) in by.items():
+            if len(names) > 1:
+                yield n, recv, frozenset(names), keyed
+
+
+def _separate(sites):
+    # Two markers each written at a site that leaves the other alone.
+    for a, b in itertools.combinations(sorted(set().union(*sites)) if sites else (), 2):
+        if any(a in s and b not in s for s in sites) and any(b in s and a not in s for s in sites):
+            yield a, b
+
+
+def inferred_stage(trees, production=default_production, markers=_MARKERS, ignore=(), declared=("state", "status")):
+    """An entity whose stage is read from which of several timestamp or flag fields are set, each written apart."""
+    prod = _prod(trees, production)
+    is_marker = _marker_test(markers, (*_NOT_STAGES, *ignore))
+    declared = {d.lower() for d in declared}
+    out = []
+    tables = _sql_entities(prod, is_marker, declared)
+    for rel, tree in prod.items():
+        for n, recv, names, keyed in _bool_reads(tree, is_marker):
+            for e in tables.values() if keyed else ():
+                if e["sites"] and names <= set().union(*e["sites"]):
+                    e["reads"].append((rel, n.lineno, names))
+    for table, e in sorted(tables.items()):
+        if e["state"]:
+            continue
+        apart = set(_separate(e["sites"]))
+        read = next(((r, ln, s) for r, ln, s in e["reads"] if any({a, b} <= s for a, b in apart)), None)
+        if read:
+            out.append(Hit(f"table:{table}", e["line"][1], _stage_why(apart, read)))
+    classes = _class_index(prod)
+    written, states = {}, set()
+    for rel, tree in prod.items():
+        for qualname, fn in _scopes(tree):
+            if qualname.rsplit(".", 1)[-1] in _CONSTRUCT:
+                continue
+            got = {}
+            for t in _own(fn):
+                if not (isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Store)):
+                    continue
+                home = _receiver_class(t.value, rel, qualname, fn, classes, t.attr)
+                if home and t.attr.lower() in declared:
+                    states.add(home)
+                if home and is_marker(t.attr):
+                    got.setdefault(home, set()).add(t.attr.lower())
+            for home, names in got.items():
+                written.setdefault(home, []).append(frozenset(names))
+    reads = []
+    for rel, tree in prod.items():
+        fns, holder = dict(_scopes(tree)), _innermost(tree)
+        for n, recv, names, keyed in _bool_reads(tree, is_marker):
+            if keyed:
+                continue
+            q = holder.get(id(n), "")
+            reads.append((rel, n.lineno, names, _receiver_class(recv, rel, q, fns.get(q), classes)))
+    by_name = classes[0]
+    for home, sites in sorted(written.items()):
+        if home in states or any(a.lower() in declared for a in _declared_attrs(home, classes)):
+            continue
+        apart = set(_separate(sites))
+        read = next(((r, ln, s) for r, ln, s, h in reads if (h is None or h == home)
+                     and any({a, b} <= s for a, b in apart)), None)
+        if read:
+            line = next((c.lineno for r, c in by_name.get(home[1], []) if r == home[0]), 1)
+            out.append(Hit(f"{home[0]}:{home[1]}", line, _stage_why(apart, read)))
+    return out
+
+
+def _declared_attrs(home, classes):
+    return {a for a, homes in classes[1].items() if home in homes}
+
+
+def _stage_why(apart, read):
+    fields = sorted({x for pair in apart for x in pair})
+    return (f"stage inferred from {', '.join(fields)}, written at separate sites and read together at "
+            f"{read[0]}:{read[1]}; declare one state field with one guarded writer")
 
 
 _GUARD = re.compile(r"(?:check|guard|ensure|refuse|require)_\w+")
@@ -2725,6 +3014,7 @@ DETECTORS = {
     "closed_tables": closed_tables,
     "latest_row_state": latest_row_state,
     "unguarded_transition": unguarded_transition,
+    "inferred_stage": inferred_stage,
     "unreached_guards": unreached_guards,
     "ignored_options": ignored_options,
     "member_defaults": member_defaults,
@@ -2754,6 +3044,7 @@ CLASSES = {
     "closed_tables": "a-closed-table-fronting-an-open-set",
     "latest_row_state": "state-is-whichever-row-came-last",
     "unguarded_transition": "a-lifecycle-with-no-declared-state",
+    "inferred_stage": "a-lifecycle-with-no-declared-state",
     "unreached_guards": "a-guard-built-and-tested-that-nothing-invokes",
     "ignored_options": "an-input-accepted-and-silently-ignored",
     "member_defaults": "one-default-tuned-for-one-member-applied-to-all",

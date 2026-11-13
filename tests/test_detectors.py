@@ -125,6 +125,89 @@ def test_a_where_built_by_substitution_is_not_read_as_unguarded():
     quiet_then_fires(detectors.unguarded_transition, innocent, bad)
 
 
+def test_an_unguarded_state_attribute_and_a_second_writer_module_are_found():
+    files = {"app/jobs.py": ("class Job:\n    def __init__(self):\n        self.state = \"pending\"\n"
+                             "    def start(self):\n        self.state = \"running\"\n"
+                             "    def finish(self):\n        if self.state != \"running\":\n            raise ValueError\n"
+                             "        self.state = \"done\"\n"),
+             "app/worker.py": ("from app.jobs import Job\n"
+                               "def cancel(job: Job):\n    job.state = State.CANCELLED\n"
+                               "def ok(job):\n    match job.state:\n        case \"running\":\n"
+                               "            job.state = \"paused\"\n")}
+    got = sites(detectors.unguarded_transition, files)
+    assert got == ["app/jobs.py:Job.start", "app/jobs.py:Job.state", "app/worker.py:cancel"]
+
+
+def test_a_guarded_constructed_or_declared_mover_state_attribute_is_left_alone():
+    innocent = {"app/jobs.py": ("MOVES = {(\"pending\", \"running\"), (\"running\", \"done\")}\n"
+                                "class Job:\n    def __init__(self):\n        self.state = \"pending\"\n"
+                                "    def move(self, to):\n        if (self.state, to) not in MOVES:\n"
+                                "            raise ValueError(to)\n        self.state = to\n"
+                                "    def go(self):\n        self.state = RUNNING\n"
+                                "def make():\n    job = Job()\n    job.state = \"pending\"\n    return job\n"
+                                "def copy(a, b):\n    a.state = b.state\n"
+                                "def code(r):\n    r.status = 200\n"),
+                "app/http.py": "def reply(r):\n    r.status = \"ok\"\n"}
+    got = detectors.unguarded_transition(detectors.parse(innocent), movers=("go",))
+    assert [h.site for h in got] == []
+    bad = {"app/other.py": "def stop(job):\n    if job.ready:\n        job.state = \"stopped\"\n"}
+    got = detectors.unguarded_transition(detectors.parse({**innocent, **bad}), movers=("go",))
+    assert [h.site for h in got] == ["app/other.py:stop", "app/jobs.py:Job.state"]
+    via = detectors.run(detectors.parse(innocent), {"c": {"detector": "unguarded_transition"}})
+    assert [h.site for h in via["c"]] == ["app/jobs.py:Job.go"]
+
+
+def test_a_stage_inferred_from_columns_written_apart_is_found():
+    files = {"app/dl.py": ("def begin(c, i):\n    c.execute(\"UPDATE downloads SET started_at = ? WHERE id = ?\", (i,))\n"
+                           "def end(c, i):\n    c.execute(\"UPDATE downloads SET finished_at = ?, note = ? WHERE id = ?\")\n"
+                           "def add(c):\n    c.execute(\"INSERT INTO downloads (url, created_at) VALUES (?, ?)\")\n"),
+             "app/view.py": ("def running(c):\n    return c.execute(\"SELECT id FROM downloads d WHERE \"\n"
+                             "                     \"d.started_at IS NOT NULL AND d.finished_at IS NULL\")\n")}
+    assert sites(detectors.inferred_stage, files) == ["table:downloads"]
+    py = {"app/dl.py": files["app/dl.py"],
+          "app/view.py": "def running(row):\n    return row[\"started_at\"] and not row[\"finished_at\"]\n"}
+    assert sites(detectors.inferred_stage, py) == ["table:downloads"]
+
+
+def test_a_stage_inferred_from_attributes_written_apart_is_found():
+    files = {"app/order.py": ("class Order:\n    def __init__(self):\n"
+                              "        self.paid_at = None\n        self.shipped_at = None\n        self.cancelled = False\n"
+                              "    def pay(self, now):\n        self.paid_at = now\n"
+                              "    def ship(self, now):\n        self.shipped_at = now\n"
+                              "    def open(self):\n        return self.paid_at is not None and self.shipped_at is None\n"),
+             "app/admin.py": "def cancel(order):\n    order.cancelled = True\n"}
+    assert sites(detectors.inferred_stage, files) == ["app/order.py:Order"]
+    got = detectors.inferred_stage(detectors.parse(files))[0]
+    assert "paid_at" in got.why and "shipped_at" in got.why and "app/order.py:" in got.why
+
+
+def test_a_stage_with_a_declared_state_or_no_joint_read_is_left_alone():
+    innocent = {"app/dl.py": ("def begin(c, i):\n    c.execute(\"UPDATE downloads SET started_at = ? WHERE id = ?\")\n"
+                              "def end(c, i):\n    c.execute(\"UPDATE downloads SET finished_at = ? WHERE id = ?\")\n"
+                              "def both(c):\n    c.execute(\"UPDATE runs SET started_at = ?, finished_at = ?\")\n"
+                              "def seen(c):\n    c.execute(\"UPDATE posts SET created_at = ?\")\n"
+                              "    c.execute(\"UPDATE posts SET updated_at = ?\")\n"
+                              "    c.execute(\"SELECT 1 FROM posts WHERE created_at IS NULL AND updated_at IS NULL\")\n"
+                              "    c.execute(\"SELECT 1 FROM runs WHERE started_at IS NULL AND finished_at IS NULL\")\n"
+                              "def go(c):\n    c.execute(\"UPDATE jobs SET started_at = ?, state = 'running' WHERE state = 'new'\")\n"
+                              "    c.execute(\"UPDATE jobs SET finished_at = ?\")\n"
+                              "    c.execute(\"SELECT 1 FROM jobs WHERE started_at IS NOT NULL AND finished_at IS NULL\")\n"
+                              "def one(c):\n    c.execute(\"SELECT 1 FROM downloads WHERE finished_at IS NULL\")\n"),
+                "app/t.py": ("class T:\n    def __init__(self):\n        self.state = \"new\"\n"
+                             "    def a(self, n):\n        self.started_at = n\n"
+                             "    def b(self, n):\n        self.finished_at = n\n"
+                             "    def live(self):\n        return self.started_at and not self.finished_at\n")}
+    bad = {"app/view.py": "def running(c):\n    c.execute(\"SELECT 1 FROM downloads WHERE started_at IS NOT NULL AND finished_at IS NULL\")\n"}
+    quiet_then_fires(detectors.inferred_stage, innocent, bad)
+    marked = detectors.inferred_stage(detectors.parse({**innocent, **bad}), markers=("_done",))
+    assert marked == []
+    ignored = detectors.inferred_stage(detectors.parse({**innocent, **bad}), ignore=("finished_at",))
+    assert ignored == []
+    via = detectors.run(detectors.parse({**innocent, **bad}), {"c": {"detector": ["unguarded_transition", "inferred_stage"]}},
+                        config={"inferred_stage": {"ignore": ("started_at",)}})
+    assert via["c"] == []
+
+
 def test_a_guard_only_tests_call_is_found():
     files = {"app/m.py": "def check_model(r):\n    return r\ndef ensure_dir(p):\n    return p\n",
              "app/n.py": "from app import m\nm.ensure_dir(1)\n",
