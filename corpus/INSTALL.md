@@ -85,7 +85,7 @@ instead of restoring it. Then show the user the failed output and stop.
        wrote pyproject.toml
        wrote tests/gauntlet/skill_classes.json
        wrote tests/gauntlet/defects.json
-       wrote tests/gauntlet/backlog.json
+       wrote tests/gauntlet/backlog.txt
        wrote tests/gauntlet/registry.py
        wrote tests/test_gauntlet.py
        backlog: 12 hit(s) seeded
@@ -140,10 +140,18 @@ instead of restoring it. Then show the user the failed output and stop.
 
 7. Read the backlog count.
 
-       grep -n "BACKLOG_PIN =" tests/gauntlet/registry.py
+       grep -c . tests/gauntlet/backlog.txt
 
-   Expect: one line, `BACKLOG_PIN = N`. Tell the user N: it is how many existing hits the repo carries.
-   It may only go down from here.
+   Expect: N, the count init printed as `backlog: N hit(s) seeded`. Tell the user N: it is how many
+   existing hits the repo carries. No row may join it later; a fix PR deletes its own lines. The ratchet
+   compares the backlog with its copy at the merge base with `origin/main`, so every CI job that runs the
+   tests must check out with `fetch-depth: 0`:
+
+       grep -n -A3 "actions/checkout" .github/workflows/*.yml
+
+   Expect: `fetch-depth: 0` under each checkout whose job runs TEST. If one lacks it, **Ask** the user
+   before adding it; without it the ratchet fails with `git fetch origin main (a CI checkout needs
+   fetch-depth: 0)`.
 
 8. List the questions init could not answer.
 
@@ -167,7 +175,7 @@ instead of restoring it. Then show the user the failed output and stop.
 
 10. Commit the files init wrote, by name.
 
-        git add pyproject.toml uv.lock tests/gauntlet/skill_classes.json tests/gauntlet/defects.json tests/gauntlet/backlog.json tests/gauntlet/registry.py tests/test_gauntlet.py
+        git add pyproject.toml uv.lock tests/gauntlet/skill_classes.json tests/gauntlet/defects.json tests/gauntlet/backlog.txt tests/gauntlet/registry.py tests/test_gauntlet.py
 
     For a Terraform-only repo use `git add .gauntlet/baseline.json .gauntlet/check.sh` instead.
     Then:
@@ -211,7 +219,9 @@ Do "Before you start", then steps 0 to 2, then these:
        git diff tests/gauntlet/registry.py
 
    Expect: removed (`-`) lines for each earlier answer. Put each one back by hand, as it was. Do not
-   restore the whole file: the new INDEX and BACKLOG_PIN come from the new tag. If a removed line is
+   restore the whole file: the new INDEX comes from the new tag. A repo wired before v0.3.6 also has
+   `tests/gauntlet/backlog.json` and a `BACKLOG_PIN` line: run `git rm tests/gauntlet/backlog.json` and
+   do not restore `BACKLOG_PIN` or `backlog_pin=`; init wrote `backlog.txt` in their place. If a removed line is
    unclear, **Ask** the user.
 
 4. Go on with steps 4 to 11. If the issue from step 1 names an older tag, retitle it:

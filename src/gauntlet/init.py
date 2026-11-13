@@ -8,14 +8,14 @@ from collections import namedtuple
 from pathlib import Path
 
 from gauntlet import __version__, detectors, findings, files, frontends, ratchet, skill
-from gauntlet.registry import Registry
+from gauntlet.registry import Registry, backlog_text
 
 URL = "git+https://github.com/unxmaal/gauntlet"
 REGISTRY_REL = "tests/gauntlet/registry.py"
 TEST_REL = "tests/test_gauntlet.py"
 SNAPSHOT_REL = "tests/gauntlet/skill_classes.json"
 DEFECTS_REL = "tests/gauntlet/defects.json"
-BACKLOG_REL = "tests/gauntlet/backlog.json"
+BACKLOG_REL = "tests/gauntlet/backlog.txt"
 BASELINE_REL = ".gauntlet/baseline.json"
 CHECK_REL = ".gauntlet/check.sh"
 TODO = "# TODO(gauntlet): "
@@ -198,18 +198,17 @@ def _dict_lines(name, items):
     return out + ["}"]
 
 
-def _registry_text(index, frontends_, backlog_pin, move_sites, todos):
+def _registry_text(index, frontends_, move_sites, todos):
     lines = [f'"""Gauntlet registry, written by `gauntlet init` {__version__}; edit it by hand."""', "",
              "from pathlib import Path", "", "from gauntlet.registry import Registry", "",
              "HERE = Path(__file__).resolve().parent", "ROOT = HERE.parent.parent", ""]
     lines += [TODO + t for t in todos]
     lines += [""] + _dict_lines("INDEX", list(index.items()))
-    lines += ["", "# Unbound hits seeded by init; lower it as the backlog is bound, never raise it.",
-              f"BACKLOG_PIN = {backlog_pin}", "", 'WAIVED = "not yet registered: gauntlet init found it"', ""]
+    lines += ["", 'WAIVED = "not yet registered: gauntlet init found it"', ""]
     lines += _dict_lines("MOVE_WAIVERS", [(site, "WAIVED") for site in move_sites])
     lines += ["", "REGISTRY = Registry(", "    root=ROOT,", "    index=INDEX,",
               '    snapshot_file=HERE / "skill_classes.json",', '    defects_file=HERE / "defects.json",',
-              '    backlog_file=HERE / "backlog.json",', "    backlog_pin=BACKLOG_PIN,",
+              '    backlog_file=HERE / "backlog.txt",',
               f"    frontends={_q(tuple(frontends_))},", "    move_waivers=MOVE_WAIVERS,", ")", ""]
     return "\n".join(lines)
 
@@ -271,14 +270,14 @@ def init_python(root, pin, has_tf, force=False):
     led, _ = ratchet.tree_ledger(reg)
     backlog = {cid: row["unbound"] for cid, row in sorted(led.items()) if row["unbound"]}
     total = sum(len(v) for v in backlog.values())
-    plan[BACKLOG_REL] = json.dumps(backlog, indent=1) + "\n"
+    plan[BACKLOG_REL] = backlog_text(backlog)
     move_sites = ratchet.move_sites(reg)
     used = {n for e in index.values() for n in detectors.names(e)}
     todos = ["production: which paths are shipped code; the default is all but tests/ and test/.",
              'repo_slug: "owner/repo" for snapshot-defects and audit; until set, defects.json stays empty.']
     todos += [f"detector_config {name}: {CONFIG_TODOS[name]}" for name in sorted(CONFIG_TODOS) if name in used]
     todos += [f"move table {s}: register a MoveTable, drop its MOVE_WAIVERS line." for s in move_sites]
-    plan[REGISTRY_REL] = _registry_text(index, fes, total, move_sites, todos)
+    plan[REGISTRY_REL] = _registry_text(index, fes, move_sites, todos)
     plan[TEST_REL] = _test_text(gate)
     ratchets = len(ratchet.tests(reg, skill_dir=skill.corpus_dir()))
     if pin != f"v{__version__}":

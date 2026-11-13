@@ -25,6 +25,11 @@ def _repo(root, files):
     for rel, text in files.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(text, encoding="utf-8")
+    # A repo whose origin/main predates the wiring, as on the branch a wiring PR comes from.
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "--", *files], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "app"], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
     return root
 
 
@@ -61,8 +66,8 @@ def test_init_wires_a_python_repo_whose_generated_tests_pass_under_pytest(pyrepo
     todos = (pyrepo / init.REGISTRY_REL).read_text(encoding="utf-8").count(init.TODO)
     assert f"TODO lines: {todos} in {init.REGISTRY_REL}" in out and todos >= 2
     assert "backlog: 1 hit(s) seeded" in out
-    assert json.loads((pyrepo / init.BACKLOG_REL).read_text()) == {
-        "a-closed-table-fronting-an-open-set": ["app/t.py:FAMILY"]}
+    assert (pyrepo / init.BACKLOG_REL).read_text() == "a-closed-table-fronting-an-open-set app/t.py:FAMILY\n"
+    assert "BACKLOG_PIN" not in (pyrepo / init.REGISTRY_REL).read_text()
     assert json.loads((pyrepo / init.DEFECTS_REL).read_text()) == []
     assert skill.load_snapshot(pyrepo / init.SNAPSHOT_REL) == skill.read_skill(skill.corpus_dir())
     dev = tomllib.loads((pyrepo / "pyproject.toml").read_text())["dependency-groups"]["dev"]
@@ -286,7 +291,6 @@ def _status(root):
 
 
 def test_a_crash_partway_through_init_writes_nothing(pyrepo, monkeypatch):
-    subprocess.run(["git", "-C", str(pyrepo), "add", "-A"], check=True)
     before = (pyrepo / "pyproject.toml").read_text()
 
     def boom(*a, **kw):
@@ -295,7 +299,7 @@ def test_a_crash_partway_through_init_writes_nothing(pyrepo, monkeypatch):
     with pytest.raises(RuntimeError, match="fell over"):
         init.run(pyrepo)
     assert (pyrepo / "pyproject.toml").read_text() == before
-    assert _status(pyrepo) == "A  app/t.py\nA  pyproject.toml\n"
+    assert _status(pyrepo) == ""
 
 
 CI = "jobs:\n  test:\n    steps:\n      - uses: actions/setup-python@v5\n        with:\n          python-version: {v}\n"

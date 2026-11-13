@@ -22,7 +22,8 @@ gauntlet writes those shapes down and checks code against them. It has two parts
   flaws here span files: a value defined in two places, a column written but never read, a guard function with no
   caller, an effect a test run can trigger against live state.
 - **It adopts without a cleanup project.** `gauntlet init` records every existing hit as a backlog. Your suite
-  passes on day one, and from then on only new hits fail. The backlog can only shrink.
+  passes on day one, and from then on only new hits fail. The backlog can only shrink: a row that is not in
+  the backlog at the merge base with `origin/main` fails.
 - **Every hit leaves a decision behind.** You can't silence a hit. You bind a test that proves the site is safe,
   or you waive it with a written reason, and both are checked on every run. A binding or waiver whose site has gone
   away also fails, so the record can't go stale.
@@ -97,7 +98,7 @@ such as "list every lifecycle" or "list every query's scope", in one standard fi
 | test | fails when | what to do |
 |---|---|---|
 | `test_gauntlet_no_new_code_trips_a_detector_without_a_bound_test` | A detector reports a site that has no bound test, no waiver and no backlog entry. | Fix the code, bind a test to the site, or waive it with a reason. |
-| `test_gauntlet_the_backlog_only_shrinks` | A backlog site has been fixed, bound or waived but is still listed, or the backlog's size differs from `backlog_pin`. | Remove the row and lower `backlog_pin` to the count the message gives. |
+| `test_gauntlet_the_backlog_only_shrinks` | A backlog site has been fixed, bound or waived but is still listed; a row is in the backlog now but not at the merge base with `backlog_base` (default `origin/main`); or that base can't be resolved. | Delete the row's line from `backlog.txt`. For a joined row, bind or waive the site instead. For a missing base, run `git fetch origin main`; a CI checkout needs `fetch-depth: 0`. |
 | `test_gauntlet_no_binding_or_waiver_is_stale` | A binding or waiver names a site the detectors no longer report, or a test is bound to a class with no detector. | Delete the binding or waiver. |
 | `test_gauntlet_registry_is_clean` | An index entry names a class missing from the corpus, lacks `instances` or `scanners`, has a waiver with no reason, or names a scanner that doesn't exist; or a defect in the snapshot has no class and no reason. | Fix the registry entry the message names. |
 | `test_gauntlet_snapshot_is_the_pinned_corpus` | The corpus your pinned gauntlet ships differs from `skill_classes.json`. This happens after you move to a new tag. | Run `gauntlet snapshot-skill --registry ...` and review the diff. |
@@ -150,13 +151,13 @@ Install the skill, so Claude Code sessions load the corpus:
 
 Wire a repo, from its top directory:
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.5" gauntlet init
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.6" gauntlet init
     uv sync && uv run pytest tests/test_gauntlet.py
 
 `corpus/INSTALL.md` is the same procedure as a step-by-step runbook, including how to move a wired repo to a new
 tag. To look at the package without wiring anything:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.5"
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.6"
     gauntlet classes          # the classes this version ships
     gauntlet corpus-dir       # where its copy of the corpus lives
 
@@ -165,12 +166,18 @@ whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
 ### What `gauntlet init` writes
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.5" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.6" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
 
 In a Python repo it adds the pin to `[dependency-groups] dev` in `pyproject.toml`, never to an extra (with
 `python_version >= '3.12'` when `requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`,
-`tests/test_gauntlet.py`, the skill snapshot, an empty defects snapshot and a backlog of today's hits, so the first
-run passes and only a new hit fails. The index holds every corpus class a detector covers; `hcl` joins the front
+`tests/test_gauntlet.py`, the skill snapshot, an empty defects snapshot and `tests/gauntlet/backlog.txt`, today's
+hits as one sorted `<class id> <site>` row per line, so the first run passes and only a new hit fails. There is
+no pin: the ratchet compares the backlog with its copy at `git merge-base HEAD origin/main` as a set, so two
+branches that each delete different lines merge cleanly. A base whose skill snapshot is missing or different
+(the PR that wires or retargets the gauntlet) seeds the backlog instead. CI must check out with
+`fetch-depth: 0` (actions/checkout) so the base is there. To migrate from `backlog.json` and `BACKLOG_PIN`,
+write each row as a line of `backlog.txt`, `git rm` the JSON, and drop `backlog_pin` from the registry; a base
+that still holds `backlog.json` is read in its place. The index holds every corpus class a detector covers; `hcl` joins the front
 ends when the repo has `.tf` files. Anything init can't work out for itself (production paths, `detector_config`
 values, move tables) becomes a `# TODO(gauntlet):` line in the registry. It refuses to overwrite a registry without `--force`, writes nothing
 unless every file was computed, prints how many ratchet tests to expect, and warns where `requires-python` or a CI
@@ -196,7 +203,7 @@ REGISTRY = Registry(
     root=HERE.parent.parent,
     index=classes.INDEX, pending=classes.PENDING, unclassified=classes.UNCLASSIFIED,
     snapshot_file=HERE / "skill_classes.json", defects_file=HERE / "defects.json",
-    backlog_file=HERE / "backlog.json", backlog_pin=62,
+    backlog_file=HERE / "backlog.txt",
     repo_slug="owner/repo",
     production=lambda rel: not rel.startswith(("tests/", "evals/cases/")),
     code_paths=r"^(?:src/|scripts/)",
