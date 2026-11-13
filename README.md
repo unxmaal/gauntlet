@@ -91,6 +91,58 @@ such as "list every lifecycle" or "list every query's scope", in one standard fi
 4. Later someone deletes `app/b.py`. The binding or waiver now points at nothing, so the stale-binding test fails
    until you remove it.
 
+### Implicit state machines
+
+The class `a-lifecycle-with-no-declared-state` asks one question of any entity that moves through stages (a job
+that is queued, running, then done; an order that is paid, shipped or cancelled): is the current stage one field,
+written by one function that refuses an illegal move? When it is not, two writers can each move the same entity, a
+crash can leave it half moved, and a combination nobody planned for (finished but never started) gets read as some
+stage anyway.
+
+The detectors look for the places where a lifecycle exists but nothing declares it:
+
+- **A state write with no guard.** `unguarded_transition` reports an `UPDATE ... SET state = ...` whose `WHERE`
+  does not name the state it leaves, so it cannot lose a race. It also reports `job.state = "done"` (any
+  `<expr>.state` or `<expr>.status`) inside a function that has not compared that same attribute earlier, by
+  `==`, `in` or a `match`. It only looks at attributes some code compares, and only at assignments of a string,
+  an upper-case constant or an enum member. Constructors (`__init__`, `__post_init__`), objects the function
+  built itself, and functions named in `movers` or that consult a `MOVES` table are left alone.
+- **A state written from several modules.** One table column (`table:jobs.state`) or one class attribute
+  (`app/jobs.py:Job.state`) written from two or more modules is reported once. The class comes from `self`, a
+  parameter annotation, a local built by the constructor, or the one class that declares the attribute.
+- **State read from the newest row.** `latest_row_state` (class `state-is-whichever-row-came-last`) reports a
+  query that takes the current state from `ORDER BY ... DESC LIMIT 1`.
+- **A stage inferred from fields.** `inferred_stage` reports an entity with no state field whose stage is read from
+  which of several timestamps or flags are set. It needs two marker fields that are written at separate sites
+  (each writer sets one and leaves the other) and some code that reads them together: `started_at IS NOT NULL AND
+  finished_at IS NULL` in one `WHERE`, or `row["started_at"] and not row["finished_at"]`,
+  `job.paid_at and not job.shipped_at` in Python. The entity is a SQL table (columns from `UPDATE ... SET` and
+  `INSERT INTO t (...)`, site `table:<name>`) or a Python class (attributes written outside the constructor, site
+  `path:Class`). Markers are names ending `_at` plus flags such as `done`, `complete`, `finished`, `cancelled`,
+  `removed`, `started`; `created_at`, `updated_at`, `modified_at` and `inserted_at` never count. A table or class
+  that also writes a `state` or `status` field is not reported, since its stage is declared.
+
+To fix a hit, declare the lifecycle. Put the states and the legal moves in one module, make one function the only
+writer, and have it refuse a move the table does not list (a compare-and-set `UPDATE ... WHERE state = ?` for a
+row). Then register the table:
+
+```python
+MoveTable("app/job_state.py:MOVES", MOVES, initial=["pending"], terminal=["done", "failed"])
+```
+
+Once registered, the ratchets hold it. `test_gauntlet_every_move_table_is_sound` fails on an unreachable state, a
+non-terminal state nothing leaves, a terminal state that moves without a named reopen, or a state the code uses that
+the table never names. `test_gauntlet_every_move_table_is_registered` fails when a new `MOVES`-shaped constant
+appears with no `MoveTable` and no waiver. `terminal_without_reader` reads the registered tables and reports a
+terminal state that only its writers mention, so nothing settles, expires or reports a row that reaches it. The
+mover itself stops being an unguarded write: its `WHERE` names the state, or it consults `MOVES`, or it is named in
+`movers`.
+
+Some of this stays with the reviewer. The detectors read Python and the SQL strings in it. A lifecycle in another
+language, a stage kept as a file on disk (a marker, a lock, a JSON record), a stage read from whether a process is
+alive, or a state attribute set through `setattr` or a generic setter that takes the new state as an argument is not
+seen. The trigger question in the corpus covers those; answer it in review.
+
 ## The tests it adds to your repo
 
 `globals().update(gauntlet.ratchet.tests(REGISTRY))` in `tests/test_gauntlet.py` adds these:
@@ -136,7 +188,8 @@ Each failure message lists every offending site, so one run shows the whole list
 | `undeadlined_wait`, `terminal_without_reader` | a-wait-with-no-deadline-owner-or-end-state | a loop or wait with no deadline, or a terminal state nothing reads |
 | `row_index_keys` | order-assumed-on-unordered-data | a dict keyed on an `enumerate()` index, which pairs rows by list position instead of identity |
 | `latest_row_state` | state-is-whichever-row-came-last | current state read from the newest row of an append-only table |
-| `unguarded_transition` | a-lifecycle-with-no-declared-state | an `UPDATE` that sets a state or status (or a configured lifecycle column) with no `WHERE` on the state it leaves, or one state column written from several modules |
+| `unguarded_transition` | a-lifecycle-with-no-declared-state | an `UPDATE` that sets a state or status (or a configured lifecycle column) with no `WHERE` on the state it leaves, an `obj.state = X` with no check of the state it leaves, or one state column or attribute written from several modules |
+| `inferred_stage` | a-lifecycle-with-no-declared-state | a table or class with no state field whose stage is read from which timestamps or flags are set, each written at a separate site |
 
 Most detectors work with no configuration. The ones that need to know your repo's names (the scope column, the
 migration path, the effect functions) find nothing until `detector_config` tells them; see below. The Terraform
@@ -151,13 +204,13 @@ Install the skill, so Claude Code sessions load the corpus:
 
 Wire a repo, from its top directory:
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.7" gauntlet init
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.8" gauntlet init
     uv sync && uv run pytest tests/test_gauntlet.py
 
 `corpus/INSTALL.md` is the same procedure as a step-by-step runbook, including how to move a wired repo to a new
 tag. To look at the package without wiring anything:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.7"
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.8"
     gauntlet classes          # the classes this version ships
     gauntlet corpus-dir       # where its copy of the corpus lives
 
@@ -166,7 +219,7 @@ whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
 ### What `gauntlet init` writes
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.7" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.8" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
 
 In a Python repo it adds the pin to `[dependency-groups] dev` in `pyproject.toml`, never to an extra (with
 `python_version >= '3.12'` when `requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`,
@@ -255,8 +308,14 @@ production function counts when that function, or a function it calls up to two 
 `REPLACE` SQL without a dedup clause (a literal, or a string the function assigns to the name it executes), or makes a
 committing call. A helper is only followed through a call that
 resolves, not through a receiver no import names. `unguarded_transition` checks the `state` and
-`status` columns; widen that with `{"unguarded_transition": {"columns": ("state", "status", "outcome")}}`. A `WHERE`
-built from an f-string substitution is not reported, since its guard cannot be read. `terminal_without_reader` gets `Registry.moves` unless
+`status` columns and attributes; widen that with `{"unguarded_transition": {"columns": ("state", "status",
+"outcome")}}`. A `WHERE` built from an f-string substitution is not reported, since its guard cannot be read. Name
+the declared writers of a state attribute with `{"unguarded_transition": {"movers": ("move", "Job.advance")}}` (a
+short name or a qualified name); a function that reads a `MOVES` or `TRANSITIONS` constant is a mover already.
+`inferred_stage` takes `markers` (a name starting `_` is a suffix, any other an exact name; a flag also matches
+with an `is_` prefix), `ignore` (more names that are not stages, added to `created_at`, `updated_at`, `modified_at`
+and `inserted_at`) and `declared` (the fields whose presence means the stage is declared, default `state` and
+`status`): `{"inferred_stage": {"markers": ("_at", "done", "shipped"), "ignore": ("seen_at",)}}`. `terminal_without_reader` gets `Registry.moves` unless
 `detector_config` gives it `tables`, and otherwise reads the declared `MOVES` literals. `unscoped_query` finds nothing
 until it is told the scope: `{"unscoped_query": {"columns": ("machine_id",), "tables": ("jobs",), "helpers": ("_here",),
 "null_helper": "app/scope.py:here"}}`; a table whose CREATE TABLE names a scope column is scoped without being listed,
