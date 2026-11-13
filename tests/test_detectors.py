@@ -497,6 +497,40 @@ def test_a_committed_id_passed_to_a_helper_that_writes_is_a_second_write():
     assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/s.py:deep", "app/s.py:once"]
 
 
+_STATE = ("def move(conn, rid, to):\n    sql = f\"UPDATE downloads SET state = ? WHERE id = ?\"\n"
+          "    return conn.execute(sql, (to, rid)).rowcount == 1\n"
+          "def look(conn, rid):\n    sql = \"SELECT state FROM downloads WHERE id = ?\"\n"
+          "    return conn.execute(sql, (rid,)).fetchone()\n")
+_DL = ("from app import state as ds\n"
+       "def start(conn, repo):\n    cur = conn.execute(\"INSERT INTO downloads (repo) VALUES (?)\", (repo,))\n"
+       "    conn.commit()\n    return cur.lastrowid\n"
+       "def finish(conn, rid):\n    conn.execute(\"UPDATE downloads SET complete = 1 WHERE id = ?\", (rid,))\n"
+       "    conn.commit()\n    return {\"id\": rid}\n"
+       "def record(conn, repo):\n    rid = start(conn, repo, commit=False)\n    return finish(conn, rid)\n"
+       "def peek(conn):\n    row = conn.execute(\"SELECT v FROM meta\").fetchone()\n    conn.commit()\n    return row\n"
+       "def schema(conn):\n    return peek(conn)\n")
+
+
+def test_a_value_a_wrapper_returns_from_a_commit_then_settled_through_a_helper_is_found():
+    innocent = {"app/state.py": _STATE, "app/dl.py": _DL, "app/b.py": (
+        "from app import state as ds\nfrom app.dl import record, schema\n"
+        "def backfill(conn, repos):\n"
+        "    def check(rid):\n        ds.look(conn, rid)\n"
+        "    def once(repo):\n        got = record(conn, repo)\n        check(got[\"id\"])\n        return got\n"
+        "    def read_only(repo):\n        v = schema(conn)\n        ds.move(conn, v, \"seen\")\n")}
+    bad = {"app/c.py": ("from app import state as ds\nfrom app.dl import record\n"
+                        "def backfill(conn, repos):\n"
+                        "    def settle(rid):\n        ds.move(conn, rid, \"removed\")\n"
+                        "    def once(repo):\n        got = record(conn, repo)\n        settle(got[\"id\"])\n"
+                        "        return got\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+    assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/c.py:backfill.once"]
+    wrapped = {"app/w.py": ("from lib import store\ndef wrap(conn):\n    return store.put(conn)\n"
+                            "def f(conn):\n    k = wrap(conn)\n    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n")}
+    got = detectors.commit_then_link(detectors.parse(wrapped), committers=("put",))
+    assert [h.site for h in got] == []
+
+
 _READ_STOPS = ("import json\n"
                "def read(path):\n    rows = []\n    for line in open(path):\n        try:\n"
                "            rows.append(json.loads(line))\n        except ValueError:\n            break\n"

@@ -734,8 +734,20 @@ class _Calls:
         return got
 
 
-def _write_call(n):
-    sql = _sql_text(n.args[0]) if n.args else None
+def _sql_arg(n, fn):
+    # The call's first argument as SQL text, read through a name the function assigns a string to.
+    if not n.args:
+        return None
+    a = n.args[0]
+    if isinstance(a, ast.Name) and fn is not None:
+        return next((t for s in _own(fn) if isinstance(s, ast.Assign)
+                     and any(isinstance(x, ast.Name) and x.id == a.id for x in s.targets)
+                     for t in [_sql_text(s.value)] if t), None)
+    return _sql_text(a)
+
+
+def _write_call(n, fn=None):
+    sql = _sql_arg(n, fn)
     return (_call_name(n) in ("execute", "executemany") and bool(sql) and bool(_LINK_SQL.search(sql))
             and not _DEDUP_SQL.search(sql))
 
@@ -753,13 +765,45 @@ def commit_then_link(trees, production=default_production, committers=()):
             return False
         if name in extra:
             return True
-        return calls.holds(rel, f, lambda k: k in named or calls.defs[k[1]][k[0]])
+        return calls.holds(rel, f, commits_def)
 
     def deferred(call):
         flag = _kw(call, "commit")
         return (flag is not None and _false(flag)) or any(k.arg in _DEDUP_KW for k in call.keywords)
 
-    memo = {}
+    memo, cmemo = {}, {}
+
+    def commits_def(key, depth=_HELPER_DEPTH):
+        # A definition commits in its own body, is named, or returns what a committing call gave it.
+        if key in named or calls.defs[key[1]].get(key[0]):
+            return True
+        if depth == 0:
+            return False
+        if (key, depth) not in cmemo:
+            cmemo[key, depth] = False
+            cmemo[key, depth] = any(_returns_commit(key[0], fn, depth) for fn in calls.fns.get(key, ()))
+        return cmemo[key, depth]
+
+    def _returns_commit(rel, fn, depth):
+        def inner(m):
+            return isinstance(m, ast.Call) and not deferred(m) and calls.holds(
+                rel, m.func, lambda k: commits_def(k, depth - 1) and sql_writes(k, _HELPER_DEPTH), resolved=True)
+        nodes = _own(fn)
+        got = {t.id for n in nodes if isinstance(n, ast.Assign) and any(inner(m) for m in _walk(n.value))
+               for x in n.targets for t in _walk(x) if isinstance(t, ast.Name)}
+        return any(isinstance(n, ast.Return) and n.value is not None
+                   and any(inner(m) or (isinstance(m, ast.Name) and m.id in got) for m in _walk(n.value))
+                   for n in nodes)
+
+    def sql_writes(key, depth):
+        # INSERT/UPDATE SQL in the body or within `depth` resolved calls: a commit after reads alone is not one.
+        if (key, depth, "sql") not in memo:
+            memo[key, depth, "sql"] = False
+            memo[key, depth, "sql"] = any(
+                _write_call(n, fn) or (depth > 0 and calls.holds(
+                    key[0], n.func, lambda k: sql_writes(k, depth - 1), resolved=True))
+                for fn in calls.fns.get(key, ()) for n in _own(fn) if isinstance(n, ast.Call))
+        return memo[key, depth, "sql"]
 
     def writes(key, depth):
         # A helper writes when its body runs INSERT/UPDATE SQL or a committing call, or calls one that does.
@@ -768,7 +812,7 @@ def commit_then_link(trees, production=default_production, committers=()):
         memo[key, depth] = False
         rel = key[0]
         found = any(
-            _write_call(n) or (not deferred(n) and resolves(rel, n.func))
+            _write_call(n, fn) or (not deferred(n) and resolves(rel, n.func))
             or (depth > 0 and calls.holds(rel, n.func, lambda k: writes(k, depth - 1), resolved=True))
             for fn in calls.fns.get(key, ()) for n in _own(fn) if isinstance(n, ast.Call))
         memo[key, depth] = found
@@ -798,7 +842,9 @@ def commit_then_link(trees, production=default_production, committers=()):
                 value = n.value if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else None
                 if value is not None and any(commits(m) for m in _walk(value)):
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                    tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name)}
+                    keys = {id(x) for t in targets for s in _walk(t) if isinstance(s, ast.Subscript)
+                            for x in _walk(s.slice)}
+                    tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name) and id(x) not in keys}
                     first = first or n.lineno
                 elif (isinstance(n, ast.Call) and _call_name(n) in ("append", "add", "extend")
                       and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
@@ -812,7 +858,7 @@ def commit_then_link(trees, production=default_production, committers=()):
                     continue
                 args = n.args + [k.value for k in n.keywords]
                 passed = any(tainted & _names(a) for a in args)
-                link = _write_call(n) and any(tainted & _names(a) for a in args[1:])
+                link = _write_call(n, fn) and any(tainted & _names(a) for a in args[1:])
                 link = link or (commits(n) and passed)
                 link = link or (passed and _call_name(n) not in ("execute", "executemany")
                                 and calls.holds(rel, n.func, lambda k: writes(k, _HELPER_DEPTH), resolved=True))
