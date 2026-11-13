@@ -2,6 +2,7 @@
 
 import ast
 import collections
+import copy
 import itertools
 import re
 from collections import namedtuple
@@ -603,6 +604,65 @@ def _dotted_expr(node):
     return ".".join([node.id, *reversed(parts)]) if isinstance(node, ast.Name) else None
 
 
+def _module_names(prod):
+    by_name = {}
+    for rel in prod:
+        for d in _dotted(rel):
+            by_name.setdefault(d, set()).add(rel)
+    return by_name
+
+
+def _module_of(dotted, bound, by_name):
+    # The module a dotted receiver names through this file's imports, or None when it names something else.
+    head, _, rest = (dotted or "").partition(".")
+    mod, attr = bound.get(head, (None, None))
+    if mod is None:
+        return None
+    full = ".".join(p for p in (mod, attr, rest) if p)
+    return full if (attr is None and not rest) or full in by_name else None
+
+
+def _same_module(a, b, by_name):
+    return a == b or bool(by_name.get(a, set()) & by_name.get(b, set()))
+
+
+def _movers(rel, bound, by_name, writers=()):
+    # (is_module(receiver), is_writer(func)) for one file: a configured "pkg.mod:fn" is a (src, dst) move.
+    specs = [w.partition(":")[::2] for w in writers]
+
+    def is_module(v):
+        return _plain_os(v) or _module_of(_dotted_expr(v), bound, by_name) is not None
+
+    def is_writer(f):
+        for mod, fn in specs:
+            if isinstance(f, ast.Name):
+                got, attr = bound.get(f.id, (None, None))
+                if (f.id == fn and got is None and rel in by_name.get(mod, ())) or (
+                        attr == fn and _same_module(got, mod, by_name)):
+                    return True
+            elif isinstance(f, ast.Attribute) and f.attr == fn:
+                got = _module_of(_dotted_expr(f.value), bound, by_name)
+                if got is not None and _same_module(got, mod, by_name):
+                    return True
+        return False
+    return is_module, is_writer
+
+
+def _move_pair(call, is_module, is_writer):
+    # [src, dst] of a move: replace/rename as a function or through a module, `p.replace(q)`, or a configured writer.
+    f = call.func
+    if is_writer(f) or (_call_name(call) in ("replace", "rename")
+                        and (isinstance(f, ast.Name) or is_module(f.value))):
+        return call.args[:2] if len(call.args) >= 2 else None
+    if _call_name(call) in ("replace", "rename"):
+        return [f.value, call.args[0]] if len(call.args) == 1 else None
+    return None
+
+
+def _plain_os(v):
+    return ast.unparse(v) == "os"
+
+
 def _resolves_to_committer(rel, bound, by_name, defs, extra):
     # Whether a callee names a committing definition: same module, an imported name, or a module's attribute.
     def committing(f):
@@ -635,10 +695,7 @@ def commit_then_link(trees, production=default_production, committers=()):
     """A helper that commits, whose returned id is then written by a second write: a death between leaves one."""
     prod = _prod(trees, production)
     defs = _committers(prod)
-    by_name = {}
-    for rel in prod:
-        for d in _dotted(rel):
-            by_name.setdefault(d, set()).add(rel)
+    by_name = _module_names(prod)
     extra = set(committers)
     out = []
     for rel, tree in prod.items():
@@ -885,11 +942,16 @@ def _mark_key(recv):
     return None
 
 
-def _marker_files(prod):
+def _marker_files(prod, by_name, writers=()):
     writes, lifts, moved = {}, {}, set()
     for rel, tree in sorted(prod.items()):
+        movers = _movers(rel, _bound(rel, tree, by_name), by_name, writers)
         for name, fn in _bodies(tree):
             for n in _own(fn):
+                pair = _move_pair(n, *movers) if isinstance(n, ast.Call) else None
+                if pair is not None and _mark_key(pair[0]):
+                    moved.add(_mark_key(pair[0]))
+                    continue
                 if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
                     continue
                 key = _mark_key(n.func.value)
@@ -901,8 +963,6 @@ def _marker_files(prod):
                     writes.setdefault(key, []).append((rel, name, n.lineno, owned))
                 elif n.func.attr == "unlink":
                     lifts.setdefault(key, set()).add((rel, name))
-                elif n.func.attr in ("replace", "rename"):
-                    moved.add(key)
     for key, rows in writes.items():
         lifted = lifts.get(key, set())
         homes = {rel for rel, *_ in rows}
@@ -914,14 +974,11 @@ def _marker_files(prod):
                   "if that path does not run, the marker stays")
 
 
-def orphanable_child(trees, production=default_production):
+def orphanable_child(trees, production=default_production, writers=()):
     """A new-session child whose only stop runs on the way out, reached from an entry point with no SIGTERM handler;
     and a marker file with no owner pid or expiry that one path alone lifts."""
     prod = _prod(trees, production)
-    by_name = {}
-    for rel in prod:
-        for d in _dotted(rel):
-            by_name.setdefault(d, set()).add(rel)
+    by_name = _module_names(prod)
     edges = {rel: _imports(rel, tree, by_name) for rel, tree in prod.items()}
     term_fns = {name.rsplit(".", 1)[-1] for tree in prod.values() for name, fn in _scopes(tree) if _installs_term(fn)}
 
@@ -950,7 +1007,7 @@ def orphanable_child(trees, production=default_production):
             reaching = [term for closure, term in entries.values() if rel in closure]
             return bool(reaching) and all(reaching)
         out.extend(_orphan_popens(rel, tree, protected))
-    out.extend(_marker_files(prod))
+    out.extend(_marker_files(prod, by_name, writers))
     return out
 
 
@@ -1539,7 +1596,7 @@ def _locks(fn):
     return False
 
 
-def _json_rmw(fn):
+def _json_rmw(fn, canon=ast.unparse, movers=(_plain_os, lambda f: False)):
     # (read keys, write keys) for JSON files this function reads and writes, each key the path's source text.
     nodes = _own(fn)
     assigned = {}
@@ -1550,7 +1607,7 @@ def _json_rmw(fn):
     def key(e, depth=0):
         if isinstance(e, ast.Name) and len(assigned.get(e.id, ())) == 1 and depth < 4:
             return key(assigned[e.id][0], depth + 1)
-        return ast.unparse(e)
+        return canon(e)
     def opened(call):
         if not (isinstance(call, ast.Call) and _call_name(call) == "open"):
             return None
@@ -1597,12 +1654,7 @@ def _json_rmw(fn):
             if k:
                 writes.add(k)
     for n in nodes:
-        if not (isinstance(n, ast.Call) and _call_name(n) in ("replace", "rename")):
-            continue
-        if isinstance(n.func, ast.Name) or ast.unparse(n.func.value) == "os":
-            pair = n.args[:2] if len(n.args) >= 2 else None
-        else:
-            pair = [n.func.value, n.args[0]] if len(n.args) == 1 else None
+        pair = _move_pair(n, *movers) if isinstance(n, ast.Call) else None
         if pair and key(pair[0]) in writes:
             writes.add(key(pair[1]))
     return reads, writes
@@ -1618,12 +1670,61 @@ def _persists(call, carries):
     return False
 
 
-def uncached_key(trees, production=default_production):
+class _Canon(ast.NodeTransformer):
+    # Rewrites module-level and imported names to "<file>:<name>", so one path names one key across the tree.
+    def __init__(self, rel, top, bound, by_name, local):
+        self.rel, self.top, self.bound, self.by_name, self.inner, self.scoped = rel, top, bound, by_name, local, False
+
+    def _home(self, mod, attr):
+        return f"{','.join(sorted(self.by_name.get(mod, ()))) or mod}:{attr}"
+
+    def visit_Attribute(self, node):
+        mod = _module_of(_dotted_expr(node.value), self.bound, self.by_name)
+        if mod is not None and _dotted_expr(node.value).partition(".")[0] not in self.inner:
+            return ast.copy_location(ast.Name(self._home(mod, node.attr)), node)
+        return self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if node.id in self.inner:
+            self.scoped = True
+        elif node.id in self.top:
+            return ast.copy_location(ast.Name(f"{self.rel}:{node.id}"), node)
+        elif node.id in self.bound:
+            mod, attr = self.bound[node.id]
+            return ast.copy_location(ast.Name(mod if attr is None else self._home(mod, attr)), node)
+        return node
+
+
+def _top_names(tree):
+    return ({n.id for n in _own(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+            | {d.name for d in tree.body if isinstance(d, _DEFS)})
+
+
+def _local_names(fn):
+    a = fn.args
+    return ({x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [v for v in (a.vararg, a.kwarg) if v]}
+            | {n.id for n in _own(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)})
+
+
+def _canon(rel, top, bound, by_name, fn):
+    # A path expression's tree-wide key; one that leans on a local name is keyed within its file only.
+    local = _local_names(fn)
+
+    def canon(e):
+        t = _Canon(rel, top, bound, by_name, local)
+        text = ast.unparse(t.visit(copy.deepcopy(e)))
+        return f"{rel}::{text}" if t.scoped else text
+    return canon
+
+
+def uncached_key(trees, production=default_production, writers=()):
     """A kept copy that no change to its source reaches: a cache over files or subprocesses keyed without an mtime
     or version, a JSON cache written back with no lock, and a process-lifetime cache whose value is persisted."""
     prod = _prod(trees, production)
+    by_name = _module_names(prod)
     out = []
     memo = set()
+    rmw = []
     for rel, tree in prod.items():
         scopes = list(_scopes(tree))
         readers = {name.rsplit(".", 1)[-1] for name, fn in scopes if _reads_source(fn)}
@@ -1635,16 +1736,18 @@ def uncached_key(trees, production=default_production):
             if cached and not stamped and _reads_source(fn, readers - {name.rsplit(".", 1)[-1]}):
                 out.append(Hit(f"{rel}:{name}", fn.lineno, "a cache over a file or a subprocess keyed without an "
                                "mtime or version: the source changes and the cache keeps the old answer"))
-        rmw = {name: (fn,) + _json_rmw(fn) for name, fn in scopes}
-        read_where = {}
-        for name, (fn, reads, _) in rmw.items():
-            for k in reads:
-                read_where.setdefault(k, []).append(fn)
-        for name, (fn, _, writes) in rmw.items():
-            shared = [k for k in writes if k in read_where]
-            if shared and not _locks(fn) and not any(_locks(r) for k in shared for r in read_where[k]):
-                out.append(Hit(f"{rel}:{name}", fn.lineno, "a JSON file read and written back with no lock: two "
-                               "writers each drop the other's entries"))
+        bound, top = _bound(rel, tree, by_name), _top_names(tree)
+        movers = _movers(rel, bound, by_name, writers)
+        rmw += [(rel, name, fn) + _json_rmw(fn, _canon(rel, top, bound, by_name, fn), movers) for name, fn in scopes]
+    read_where = {}
+    for *_, fn, reads, _ in rmw:
+        for k in reads:
+            read_where.setdefault(k, []).append(fn)
+    for rel, name, fn, _, writes in rmw:
+        shared = [k for k in writes if k in read_where]
+        if shared and not _locks(fn) and not any(_locks(r) for k in shared for r in read_where[k]):
+            out.append(Hit(f"{rel}:{name}", fn.lineno, "a JSON file read and written back with no lock: two "
+                           "writers each drop the other's entries"))
     for rel, tree in prod.items():
         for name, fn in _bodies(tree):
             if name.rsplit(".", 1)[-1] in memo:

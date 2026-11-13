@@ -98,7 +98,7 @@ such as "list every lifecycle" or "list every query's scope", in one standard fi
 | test | fails when | what to do |
 |---|---|---|
 | `test_gauntlet_no_new_code_trips_a_detector_without_a_bound_test` | A detector reports a site that has no bound test, no waiver and no backlog entry. | Fix the code, bind a test to the site, or waive it with a reason. |
-| `test_gauntlet_the_backlog_only_shrinks` | A backlog site has been fixed, bound or waived but is still listed; a row is in the backlog now but not at the merge base with `backlog_base` (default `origin/main`); or that base can't be resolved. | Delete the row's line from `backlog.txt`. For a joined row, bind or waive the site instead. For a missing base, run `git fetch origin main`; a CI checkout needs `fetch-depth: 0`. |
+| `test_gauntlet_the_backlog_only_shrinks` | A backlog site has been fixed, bound or waived but is still listed; a row is in the backlog now but not at the merge base with `backlog_base` (default `origin/main`); or that base can't be resolved. A row that moved files is allowed: same class, same site after the path, and exactly one row on each side matches; the test passes with a warning naming the move. | Delete the row's line from `backlog.txt`. For a joined row, bind or waive the site instead. For a site that moved, change its line to the new path (the failure names it). For a missing base, run `git fetch origin main`; a CI checkout needs `fetch-depth: 0`. |
 | `test_gauntlet_no_binding_or_waiver_is_stale` | A binding or waiver names a site the detectors no longer report, or a test is bound to a class with no detector. | Delete the binding or waiver. |
 | `test_gauntlet_registry_is_clean` | An index entry names a class missing from the corpus, lacks `instances` or `scanners`, has a waiver with no reason, or names a scanner that doesn't exist; or a defect in the snapshot has no class and no reason. | Fix the registry entry the message names. |
 | `test_gauntlet_snapshot_is_the_pinned_corpus` | The corpus your pinned gauntlet ships differs from `skill_classes.json`. This happens after you move to a new tag. | Run `gauntlet snapshot-skill --registry ...` and review the diff. |
@@ -151,13 +151,13 @@ Install the skill, so Claude Code sessions load the corpus:
 
 Wire a repo, from its top directory:
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.6" gauntlet init
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.7" gauntlet init
     uv sync && uv run pytest tests/test_gauntlet.py
 
 `corpus/INSTALL.md` is the same procedure as a step-by-step runbook, including how to move a wired repo to a new
 tag. To look at the package without wiring anything:
 
-    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.6"
+    pip install "git+https://github.com/unxmaal/gauntlet@v0.3.7"
     gauntlet classes          # the classes this version ships
     gauntlet corpus-dir       # where its copy of the corpus lives
 
@@ -166,7 +166,7 @@ whatever is in the local skill directory. `GAUNTLET_SKILL_DIR` overrides it.
 
 ### What `gauntlet init` writes
 
-    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.6" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
+    uvx --from "gauntlet[hcl] @ git+https://github.com/unxmaal/gauntlet@v0.3.7" gauntlet init [--root DIR] [--pin vX.Y.Z] [--force]
 
 In a Python repo it adds the pin to `[dependency-groups] dev` in `pyproject.toml`, never to an extra (with
 `python_version >= '3.12'` when `requires-python` admits older Pythons), and writes `tests/gauntlet/registry.py`,
@@ -251,7 +251,10 @@ built from an f-string substitution is not reported, since its guard cannot be r
 until it is told the scope: `{"unscoped_query": {"columns": ("machine_id",), "tables": ("jobs",), "helpers": ("_here",),
 "null_helper": "app/scope.py:here"}}`; a table whose CREATE TABLE names a scope column is scoped without being listed,
 and uppercase SQL keywords are what mark a string as a query. `stored_pid_liveness` finds a helper that only does
-`os.kill(pid, 0)`; name others with `{"stored_pid_liveness": {"alive": ("running",)}}`. `prose_match` needs the
+`os.kill(pid, 0)`; name others with `{"stored_pid_liveness": {"alive": ("running",)}}`. `uncached_key` pairs a
+JSON file's writer and reader across modules by a shared path constant or expression, and reads a two-argument
+`replace` or `rename` as a move when called by name or through an imported module; name a wrapper with another name
+with `{"uncached_key": {"writers": ("pkg.atomic_file:swap",)}}` (`orphanable_child` takes the same `writers`). `prose_match` needs the
 fields that hold prose: `{"prose_match": {"fields": ("note", "detail", "reason")}}`. `empty_on_failure` finds
 store choosers only once named: `{"empty_on_failure": {"choosers": ("backend",)}}`, and a module that defines a chooser
 is not a copy of it. `unpaired_column` reads the schema from `{"unpaired_column": {"migrations": ("app/migrations/",),
