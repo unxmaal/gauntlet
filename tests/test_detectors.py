@@ -423,6 +423,114 @@ def test_a_committer_is_a_call_that_resolves_to_a_committing_definition_not_a_sh
     assert sorted(h.site for h in got) == ["app/b.py:close", "app/b.py:other", "app/c.py:f"]
 
 
+_LINKS = ("def f(conn, x):\n    v = ms.decide(conn, x)\n"
+          "    conn.execute(\"UPDATE runs SET v = ? WHERE id = ?\", (v, x))\n"
+          "def g(conn, x):\n    k = store_put(conn, x)\n    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n")
+
+
+def test_a_committer_re_exported_by_a_package_init_is_followed_to_its_definition():
+    plain = _ADD.replace("    conn.commit()\n", "")
+    init = {"app/ms/__init__.py": "from .tx import add as decide\nfrom app.ms.tx import add as put\n",
+            "app/c.py": "from app import ms\nfrom app.ms import put as store_put\n" + _LINKS}
+    quiet_then_fires(detectors.commit_then_link, {**init, "app/ms/tx.py": plain}, {"app/ms/tx.py": _ADD})
+    assert sites(detectors.commit_then_link, {**init, "app/ms/tx.py": _ADD}) == ["app/c.py:f", "app/c.py:g"]
+
+
+def test_a_re_export_cycle_between_package_inits_terminates_and_resolves_nothing():
+    files = {"app/p/__init__.py": "from app.q import decide\n", "app/q/__init__.py": "from app.p import decide\n",
+             "app/c.py": "from app import p\nfrom app.q import decide as store_put\nms = p\n" + _LINKS}
+    assert sites(detectors.commit_then_link, files) == []
+
+
+_DECIDE_PLAIN = ("def decide(conn, x):\n    cur = conn.execute(\"INSERT INTO verdicts (x) VALUES (?)\", (x,))\n"
+                 "    return cur.lastrowid\n")
+_CALLS = ("def f(conn, x):\n    v = {}.decide(conn, x)\n"
+          "    conn.execute(\"INSERT INTO log (v) VALUES (?)\", (v,))\n")
+
+
+def test_a_qualified_committer_matches_only_calls_that_resolve_to_that_definition():
+    files = {"app/x.py": _DECIDE_PLAIN, "app/y.py": _DECIDE_PLAIN,
+             "app/pkg/__init__.py": "from app.x import decide\n",
+             "app/cx.py": "from app import x\n" + _CALLS.format("x"),
+             "app/cy.py": "from app import y\n" + _CALLS.format("y"),
+             "app/co.py": _CALLS.format("obj").replace("conn, x)", "conn, x, obj)", 1)}
+    trees = detectors.parse(files)
+
+    def fired(*committers):
+        return sorted(h.site for h in detectors.commit_then_link(trees, committers=committers))
+    assert fired() == []
+    assert fired("decide") == ["app/co.py:f", "app/cx.py:f", "app/cy.py:f"]
+    assert fired("app.x:decide") == ["app/cx.py:f"]
+    assert fired("app/x.py:decide") == ["app/cx.py:f"]
+    assert fired("x.py:decide") == ["app/cx.py:f"]
+    assert fired("app.pkg:decide") == ["app/cx.py:f"]
+    assert fired("app.x:decide", "app.y:decide") == ["app/co.py:f", "app/cx.py:f", "app/cy.py:f"]
+    try:
+        fired("app.z:decide")
+    except ValueError as e:
+        assert "app.z:decide" in str(e)
+    else:
+        raise AssertionError("a qualified committer naming nothing was accepted")
+
+
+_HELPERS = ("from app import q\n"
+            "def settle(conn, jid):\n    conn.execute(\"UPDATE runs SET job_id = ?\", (jid,))\n"
+            "def peek(conn, jid):\n    return conn.execute(\"SELECT * FROM runs WHERE job_id = ?\", (jid,)).fetchone()\n"
+            "def keyed(conn, jid):\n    conn.execute(\"INSERT INTO runs (job_id) VALUES (?) ON CONFLICT DO NOTHING\", (jid,))\n"
+            "def via(conn, jid):\n    settle(conn, jid)\n"
+            "def h2(conn, jid):\n    via(conn, jid)\n"
+            "def h3(conn, jid):\n    h2(conn, jid)\n")
+
+
+def test_a_committed_id_passed_to_a_helper_that_writes_is_a_second_write():
+    innocent = {"app/q.py": _ADD, "app/h.py": _HELPERS, "app/r.py": (
+        "from app import h, q\n"
+        "def reads(conn, v):\n    jid = q.add(conn, v)\n    return h.peek(conn, jid)\n"
+        "def deduped(conn, v):\n    jid = q.add(conn, v)\n    h.keyed(conn, jid)\n"
+        "def too_deep(conn, v):\n    jid = q.add(conn, v)\n    h.h3(conn, jid)\n"
+        "def other(conn, v, w):\n    jid = q.add(conn, v)\n    h.settle(conn, w)\n    return jid\n"
+        "def unbound(conn, v, log):\n    jid = q.add(conn, v)\n    log.settle(conn, jid)\n")}
+    bad = {"app/s.py": ("from app import q\nfrom app.h import settle, h2\n"
+                        "def once(conn, v):\n    jid = q.add(conn, v)\n    settle(conn, jid)\n"
+                        "def deep(conn, v):\n    jid = q.add(conn, v)\n    h2(conn, jid=jid)\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+    assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/s.py:deep", "app/s.py:once"]
+
+
+_STATE = ("def move(conn, rid, to):\n    sql = f\"UPDATE downloads SET state = ? WHERE id = ?\"\n"
+          "    return conn.execute(sql, (to, rid)).rowcount == 1\n"
+          "def look(conn, rid):\n    sql = \"SELECT state FROM downloads WHERE id = ?\"\n"
+          "    return conn.execute(sql, (rid,)).fetchone()\n")
+_DL = ("from app import state as ds\n"
+       "def start(conn, repo):\n    cur = conn.execute(\"INSERT INTO downloads (repo) VALUES (?)\", (repo,))\n"
+       "    conn.commit()\n    return cur.lastrowid\n"
+       "def finish(conn, rid):\n    conn.execute(\"UPDATE downloads SET complete = 1 WHERE id = ?\", (rid,))\n"
+       "    conn.commit()\n    return {\"id\": rid}\n"
+       "def record(conn, repo):\n    rid = start(conn, repo, commit=False)\n    return finish(conn, rid)\n"
+       "def peek(conn):\n    row = conn.execute(\"SELECT v FROM meta\").fetchone()\n    conn.commit()\n    return row\n"
+       "def schema(conn):\n    return peek(conn)\n")
+
+
+def test_a_value_a_wrapper_returns_from_a_commit_then_settled_through_a_helper_is_found():
+    innocent = {"app/state.py": _STATE, "app/dl.py": _DL, "app/b.py": (
+        "from app import state as ds\nfrom app.dl import record, schema\n"
+        "def backfill(conn, repos):\n"
+        "    def check(rid):\n        ds.look(conn, rid)\n"
+        "    def once(repo):\n        got = record(conn, repo)\n        check(got[\"id\"])\n        return got\n"
+        "    def read_only(repo):\n        v = schema(conn)\n        ds.move(conn, v, \"seen\")\n")}
+    bad = {"app/c.py": ("from app import state as ds\nfrom app.dl import record\n"
+                        "def backfill(conn, repos):\n"
+                        "    def settle(rid):\n        ds.move(conn, rid, \"removed\")\n"
+                        "    def once(repo):\n        got = record(conn, repo)\n        settle(got[\"id\"])\n"
+                        "        return got\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+    assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/c.py:backfill.once"]
+    wrapped = {"app/w.py": ("from lib import store\ndef wrap(conn):\n    return store.put(conn)\n"
+                            "def f(conn):\n    k = wrap(conn)\n    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n")}
+    got = detectors.commit_then_link(detectors.parse(wrapped), committers=("put",))
+    assert [h.site for h in got] == []
+
+
 _READ_STOPS = ("import json\n"
                "def read(path):\n    rows = []\n    for line in open(path):\n        try:\n"
                "            rows.append(json.loads(line))\n        except ValueError:\n            break\n"
