@@ -242,7 +242,8 @@ is the same check as a plain assertion.
 
 A detector that needs repo knowledge takes it from `Registry(detector_config={name: kwargs})`.
 `commit_then_link` finds committing helpers by their `conn.commit()`, and counts a call only when it resolves to
-one (same module, an imported name or a module attribute); name others with
+one (same module, an imported name or a module attribute). A call through a receiver no import names (a parameter or
+a local object) counts when every definition of that method name commits, and not when the name is ambiguous; name others with
 `{"commit_then_link": {"committers": ("put",)}}`, which match by name. `unguarded_transition` checks the `state` and
 `status` columns; widen that with `{"unguarded_transition": {"columns": ("state", "status", "outcome")}}`. A `WHERE`
 built from an f-string substitution is not reported, since its guard cannot be read. `terminal_without_reader` gets `Registry.moves` unless

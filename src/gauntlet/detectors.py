@@ -621,6 +621,8 @@ def _resolves_to_committer(rel, bound, by_name, defs, extra):
         recv = _dotted_expr(f.value)
         head, _, rest = (recv or "").partition(".")
         mod, attr = bound.get(head, (None, None))
+        if mod is None:  # a receiver no import names: count the name only if every definition of it commits
+            return bool(homes) and all(homes.values())
         full = ".".join(p for p in (mod, attr, rest) if p)
         while full and full not in by_name:
             full = full.rpartition(".")[0]

@@ -413,6 +413,12 @@ def test_a_committer_is_a_call_that_resolves_to_a_committing_definition_not_a_sh
                                          "class S:\n    def j(self, conn, i):\n        m = self._move(conn, i)\n"
                                          "        conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n")}
     assert sites(detectors.commit_then_link, same) == ["app/a.py:S.j", "app/a.py:k"]
+    unique = {"app/s.py": ("class Store:\n    def put_row(self, conn, v):\n"
+                           "        cur = conn.execute(\"INSERT INTO rows (v) VALUES (?)\", (v,))\n"
+                           "        conn.commit()\n        return cur.lastrowid\n"),
+              "app/u.py": ("def f(conn, store, v):\n    k = store.put_row(conn, v)\n"
+                           "    conn.execute(\"INSERT INTO refs (k) VALUES (?)\", (k,))\n")}
+    assert sites(detectors.commit_then_link, {**innocent, **unique}) == ["app/u.py:f"]
     got = detectors.commit_then_link(detectors.parse(innocent), committers=("_move",))
     assert sorted(h.site for h in got) == ["app/b.py:close", "app/b.py:other", "app/c.py:f"]
 
