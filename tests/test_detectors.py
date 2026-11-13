@@ -105,6 +105,26 @@ def test_a_guarded_state_write_from_one_module_is_left_alone():
     quiet_then_fires(detectors.unguarded_transition, innocent, bad)
 
 
+def test_a_configured_lifecycle_column_is_checked_and_the_default_is_unchanged():
+    guarded = {"app/o.py": "def settle(c, i):\n    c.execute(\"UPDATE runs SET outcome = ? WHERE id = ? AND outcome IS NULL\")\n"}
+    bad = {"app/p.py": "def settle(c, i):\n    c.execute(\"UPDATE trials SET outcome = ? WHERE id = ?\", (i,))\n"}
+    files = detectors.parse({**guarded, **bad})
+    assert sorted(h.site for h in detectors.unguarded_transition(files)) == []
+    got = detectors.unguarded_transition(files, columns=("state", "status", "outcome"))
+    assert sorted(h.site for h in got) == ["app/p.py:settle"]
+    assert detectors.unguarded_transition(detectors.parse(guarded), columns=("outcome",)) == []
+    via = detectors.run(files, {"c": {"detector": "unguarded_transition"}},
+                        config={"unguarded_transition": {"columns": ("outcome",)}})
+    assert [h.site for h in via["c"]] == ["app/p.py:settle"]
+
+
+def test_a_where_built_by_substitution_is_not_read_as_unguarded():
+    innocent = {"app/f.py": ("def move(c, cond):\n    c.execute(f\"UPDATE jobs SET state = ? WHERE {cond}\")\n"
+                             "def other(c, i):\n    c.execute(f\"UPDATE runs SET state = ? WHERE id = ? AND {i}\")\n")}
+    bad = {"app/g.py": "def move(c, t):\n    c.execute(f\"UPDATE {t} SET state = ? WHERE id = ?\")\n"}
+    quiet_then_fires(detectors.unguarded_transition, innocent, bad)
+
+
 def test_a_guard_only_tests_call_is_found():
     files = {"app/m.py": "def check_model(r):\n    return r\ndef ensure_dir(p):\n    return p\n",
              "app/n.py": "from app import m\nm.ensure_dir(1)\n",
@@ -363,6 +383,38 @@ def test_a_consumer_names_a_committer_the_scan_cannot_see():
     assert sites(detectors.commit_then_link, files) == []
     got = detectors.commit_then_link(detectors.parse(files), committers=("put",))
     assert [h.site for h in got] == ["app/r.py:f"]
+
+
+_MOVE_COMMITS = ("def _move(conn, i):\n    cur = conn.execute(\"INSERT INTO moves (i) VALUES (?)\", (i,))\n"
+                 "    conn.commit()\n    return cur.lastrowid\n")
+_MOVE_PLAIN = ("def _move(conn, i):\n    cur = conn.execute(\"INSERT INTO moves (i) VALUES (?)\", (i,))\n"
+               "    return cur.lastrowid\n")
+
+
+def test_a_committer_is_a_call_that_resolves_to_a_committing_definition_not_a_shared_name():
+    innocent = {"app/a.py": _MOVE_COMMITS, "app/b.py": _MOVE_PLAIN + (
+        "from app import a\n"
+        "def close(conn, i):\n    m = _move(conn, i)\n"
+        "    conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n"
+        "def other(conn, i, x):\n    m = x._move(conn, i)\n"
+        "    conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n"),
+        "app/c.py": ("from app import b\nfrom app.b import _move as mv\n"
+                     "def f(conn, i):\n    m = b._move(conn, i)\n    n = mv(conn, i)\n"
+                     "    conn.execute(\"INSERT INTO log (m, n) VALUES (?, ?)\", (m, n))\n")}
+    bad = {"app/d.py": ("from app import a\nfrom app.a import _move as mv\n"
+                        "def g(conn, i):\n    m = a._move(conn, i)\n"
+                        "    conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n"
+                        "def h(conn, i):\n    n = mv(conn, i)\n"
+                        "    conn.execute(\"INSERT INTO log (n) VALUES (?)\", (n,))\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+    assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/d.py:g", "app/d.py:h"]
+    same = {"app/a.py": _MOVE_COMMITS + ("def k(conn, i):\n    m = _move(conn, i)\n"
+                                         "    conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n"
+                                         "class S:\n    def j(self, conn, i):\n        m = self._move(conn, i)\n"
+                                         "        conn.execute(\"INSERT INTO log (m) VALUES (?)\", (m,))\n")}
+    assert sites(detectors.commit_then_link, same) == ["app/a.py:S.j", "app/a.py:k"]
+    got = detectors.commit_then_link(detectors.parse(innocent), committers=("_move",))
+    assert sorted(h.site for h in got) == ["app/b.py:close", "app/b.py:other", "app/c.py:f"]
 
 
 _READ_STOPS = ("import json\n"
