@@ -1,6 +1,7 @@
 """The ratchets a consumer's test suite runs over its registry; tests(reg) returns them as pytest test functions."""
 
 import re
+import warnings
 
 from gauntlet import detectors, frontends, moves, registry, review, skill
 
@@ -86,15 +87,24 @@ def unbound(reg, led):
 
 
 def backlog_problems(reg, led):
+    if reg.backlog_pin is not None:
+        warnings.warn("backlog_pin is ignored: the backlog is checked against its merge base with backlog_base",
+                      DeprecationWarning, stacklevel=2)
     backlog = reg.backlog()
     out = [f"{cid}: {s} is bound, waived or gone: remove it from the backlog" for cid, rows in backlog.items()
            for s in rows if s not in led.get(cid, {}).get("unbound", [])]
-    total = sum(len(v) for v in backlog.values())
-    if reg.backlog_pin is not None and total > reg.backlog_pin:
-        out.append(f"the backlog grew to {total}, pinned at {reg.backlog_pin}")
-    elif reg.backlog_pin is not None and total < reg.backlog_pin:
-        out.append(f"the backlog shrank to {total}: lower backlog_pin to {total}")
-    return out
+    rows = {(cid, s) for cid, sites in backlog.items() for s in sites}
+    if not rows:
+        return out
+    try:
+        base = reg.base_backlog()
+    except LookupError as e:
+        return out + [str(e)]
+    if base is None:
+        return out
+    had = {(cid, s) for cid, sites in base.items() for s in sites}
+    return out + [f"{cid}: {s} joined the backlog since {reg.backlog_base}: bind it or waive it instead"
+                  for cid, s in sorted(rows - had)]
 
 
 def stale(reg, led, marks):

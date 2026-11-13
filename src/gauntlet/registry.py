@@ -12,6 +12,7 @@ from gauntlet import review, skill
 
 _CLOSING = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#(\d+)")
 TEST_PREFIXES = ("tests/", "test/")
+FETCH = "git fetch origin main (a CI checkout needs fetch-depth: 0)"
 
 
 def default_production(rel):
@@ -29,6 +30,7 @@ class Registry:
     unclassified: dict = field(default_factory=dict)
     backlog_file: Path | None = None
     backlog_pin: int | None = None
+    backlog_base: str = "origin/main"
     repo_slug: str | None = None
     defect_label: str = "defect"
     production: Callable[[str], bool] = default_production
@@ -49,7 +51,53 @@ class Registry:
     def backlog(self):
         if self.backlog_file is None or not Path(self.backlog_file).exists():
             return {}
-        return json.loads(Path(self.backlog_file).read_text(encoding="utf-8"))
+        return parse_backlog(Path(self.backlog_file).read_text(encoding="utf-8"), Path(self.backlog_file).suffix)
+
+    def base_backlog(self):
+        """The backlog at the merge base with backlog_base; None when that base predates this snapshot's wiring."""
+        base = _git(self.root, "merge-base", "HEAD", self.backlog_base)
+        if base.returncode:
+            raise LookupError(FETCH)
+        sha = base.stdout.strip()
+        snap = _at(self.root, sha, self.snapshot_file)
+        if snap is None or json.loads(snap) != json.loads(Path(self.snapshot_file).read_text(encoding="utf-8")):
+            return None
+        path = Path(self.backlog_file)
+        text = _at(self.root, sha, path)
+        if text is None and path.suffix == ".txt":
+            path = path.with_suffix(".json")
+            text = _at(self.root, sha, path)
+        return {} if text is None else parse_backlog(text, path.suffix)
+
+
+def parse_backlog(text, suffix):
+    """{class id: [sites]} from a backlog's text: JSON, or one `<class id> <site>` row per line for .txt."""
+    if suffix != ".txt":
+        return json.loads(text)
+    out = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        cid, sep, site = line.partition(" ")
+        if not sep or not site:
+            raise ValueError(f"backlog row {line!r} is not `<class id> <site>`")
+        out.setdefault(cid, []).append(site)
+    return out
+
+
+def backlog_text(backlog):
+    return "".join(f"{cid} {s}\n" for cid, s in sorted((c, s) for c, sites in backlog.items() for s in sites))
+
+
+def _git(root, *args):
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8")
+
+
+def _at(root, sha, path):
+    top = _git(root, "rev-parse", "--show-toplevel").stdout.strip()
+    rel = Path(path).resolve().relative_to(Path(top).resolve()).as_posix()
+    got = _git(root, "show", f"{sha}:{rel}")
+    return got.stdout if got.returncode == 0 else None
 
 
 def load_defects(path):
