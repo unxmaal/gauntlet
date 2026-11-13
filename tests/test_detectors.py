@@ -531,6 +531,21 @@ def test_a_value_a_wrapper_returns_from_a_commit_then_settled_through_a_helper_i
     assert [h.site for h in got] == []
 
 
+def test_a_statement_that_assigns_a_committed_value_does_not_also_write_it():
+    innocent = {"app/q.py": _ADD, "app/h.py": _HELPERS, "app/r.py": (
+        "from app import h, q\n"
+        "def lease(conn, v):\n    own = h.peek(conn, v)\n    own = own and q.add(conn, own)\n    return own\n"
+        "def keyed(conn, r):\n    r[\"recorded\"] = q.add(conn, r)\n    return r\n")}
+    bad = {"app/s.py": ("from app import h, q\n"
+                        "def once(conn, v):\n    x = q.add(conn, v)\n    h.settle(conn, x)\n"
+                        "def again(conn, v):\n    x = q.add(conn, v)\n    x = x and h.settle(conn, x)\n"
+                        "def chain(conn, vs):\n    jid = None\n    for v in vs:\n        jid = q.add(conn, v, jid)\n"
+                        "def twice(conn, v):\n    x = q.add(conn, v)\n    x = q.add(conn, x)\n")}
+    quiet_then_fires(detectors.commit_then_link, innocent, bad)
+    assert sites(detectors.commit_then_link, {**innocent, **bad}) == ["app/s.py:again", "app/s.py:chain",
+                                                                      "app/s.py:once", "app/s.py:twice"]
+
+
 _READ_STOPS = ("import json\n"
                "def read(path):\n    rows = []\n    for line in open(path):\n        try:\n"
                "            rows.append(json.loads(line))\n        except ValueError:\n            break\n"

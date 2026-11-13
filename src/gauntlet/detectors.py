@@ -837,19 +837,28 @@ def commit_then_link(trees, production=default_production, committers=()):
 
             def commits(call):
                 return isinstance(call, ast.Call) and committing(call.func) and not deferred(call)
-            tainted, first = set(), None
+            tainted, first, since, within = set(), None, {}, {}
+            looped = {id(m) for loop in nodes if isinstance(loop, (ast.For, ast.AsyncFor, ast.While))
+                      for m in _walk(loop)}
+
+            def taint(n, got, tainted=tainted, since=since, within=within, looped=looped):
+                tainted.update(got)
+                for g in got:
+                    since[g] = min(since.get(g, n.lineno), n.lineno)
+                if id(n) not in looped:
+                    within.update({id(m): n.lineno for m in _walk(n)})
             for n in nodes:
                 value = n.value if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) else None
                 if value is not None and any(commits(m) for m in _walk(value)):
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
                     keys = {id(x) for t in targets for s in _walk(t) if isinstance(s, ast.Subscript)
                             for x in _walk(s.slice)}
-                    tainted |= {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name) and id(x) not in keys}
+                    taint(n, {x.id for t in targets for x in _walk(t) if isinstance(x, ast.Name) and id(x) not in keys})
                     first = first or n.lineno
                 elif (isinstance(n, ast.Call) and _call_name(n) in ("append", "add", "extend")
                       and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
                       and any(commits(m) for a in n.args for m in _walk(a))):
-                    tainted.add(n.func.value.id)
+                    taint(n, {n.func.value.id})
                     first = first or n.lineno
             if not tainted:
                 continue
@@ -857,8 +866,10 @@ def commit_then_link(trees, production=default_production, committers=()):
                 if not isinstance(n, ast.Call) or n.lineno < first:
                     continue
                 args = n.args + [k.value for k in n.keywords]
-                passed = any(tainted & _names(a) for a in args)
-                link = _write_call(n, fn) and any(tainted & _names(a) for a in args[1:])
+                # A statement's own assignment happens after its calls run, so it taints only later statements.
+                live = {t for t in tainted if since[t] < within[id(n)]} if id(n) in within else tainted
+                passed = any(live & _names(a) for a in args)
+                link = _write_call(n, fn) and any(live & _names(a) for a in args[1:])
                 link = link or (commits(n) and passed)
                 link = link or (passed and _call_name(n) not in ("execute", "executemany")
                                 and calls.holds(rel, n.func, lambda k: writes(k, _HELPER_DEPTH), resolved=True))
